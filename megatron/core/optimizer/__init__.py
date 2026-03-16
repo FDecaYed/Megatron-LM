@@ -50,8 +50,8 @@ from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_versio
 from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
-    HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _sync_emerging_optimizer_registry,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -550,12 +550,7 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if not HAVE_EMERGING_OPTIMIZERS:
-        raise ImportError(
-            f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
-            "Install it with: pip install emerging-optimizers"
-        )
-    if eopt_name not in _EMERGING_OPTIMIZERS:
+    if not _sync_emerging_optimizer_registry(eopt_name):
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')

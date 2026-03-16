@@ -3,9 +3,9 @@
 """Emerging optimizer registry.
 
 To add a new emerging optimizer:
-  1. Define its optimizer class (or import it).
-  2. Write its ``_<name>_init_state_fn`` and ``_<name>_config_to_kwargs``.
-  3. Add an ``EmergingOptimizerEntry`` to ``_EMERGING_OPTIMIZERS`` at the bottom.
+  1. Register it in ``emerging_optimizers.registry`` via decorator.
+  2. Ensure the optimizer module is importable from the ``emerging_optimizers`` package.
+  3. Megatron will auto-discover and expose it through ``OptimizerConfig.optimizer``.
 """
 
 import inspect
@@ -23,16 +23,11 @@ from .optimizer_config import ParamKey, ParamPredicate
 
 try:
     from emerging_optimizers import registry
-    from emerging_optimizers.orthogonalized_optimizers import (
-        OrthogonalizedOptimizer,
-        get_muon_scale_factor,
-    )
+    from emerging_optimizers.orthogonalized_optimizers.muon import get_muon_scale_factor
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
-
-    # Registration happens on import. It is necessary to import class for the registry to work
-    # even if the imported class is not used directly.
-    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
-    from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+    from emerging_optimizers.orthogonalized_optimizers.orthogonalized_optimizer import (
+        OrthogonalizedOptimizer,
+    )
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
@@ -41,6 +36,46 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _get_default_param_overrides() -> Dict[ParamKey, Dict[str, Any]]:
+    return {
+        ParamKey(
+            predicate=ParamPredicate(name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding)
+        ): {'optimizer': 'adam'}
+    }
+
+
+def _sync_emerging_optimizer_registry(eopt_name: str) -> bool:
+    """Sync Megatron entry for the requested optimizer only.
+
+    Returns:
+        bool: True if optimizer is available in Megatron registry after sync.
+
+    Raises:
+        ImportError: If the emerging-optimizers package is unavailable.
+    """
+    if not HAVE_EMERGING_OPTIMIZERS:
+        raise ImportError(
+            f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
+            "Install it with: pip install emerging-optimizers"
+        )
+
+    requested_name = eopt_name.lower()
+    if hasattr(registry, "ensure_optimizer_registered"):
+        registry.ensure_optimizer_registered(requested_name)
+
+    if requested_name in _EMERGING_OPTIMIZERS:
+        return True
+    if requested_name not in registry.get_optimizer_name_list():
+        return False
+    _EMERGING_OPTIMIZERS[requested_name] = EmergingOptimizerEntry(
+        optimizer_cls=registry.get_optimizer_cls(requested_name),
+        init_state_fn=_eopt_init_state_fn,
+        config_to_kwargs=None,
+        default_param_overrides=_get_default_param_overrides(),
+    )
+    return True
 
 
 # ===========================================================================
@@ -275,32 +310,7 @@ _EMERGING_OPTIMIZERS = {
         optimizer_cls=TensorParallelMuon,
         init_state_fn=_eopt_init_state_fn,
         config_to_kwargs=_muon_config_to_kwargs,
-        default_param_overrides={
-            ParamKey(
-                predicate=ParamPredicate(
-                    name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                )
-            ): {'optimizer': 'adam'}
-        },
+        default_param_overrides=_get_default_param_overrides(),
     )
 }
 
-# Register soap with default config
-# TODO(skyw): register all emerging optimizers.
-if HAVE_EMERGING_OPTIMIZERS:
-    # Only imported optimizers will be in registry.
-    for eopt_name in registry.get_optimizer_name_list():
-        if eopt_name in _EMERGING_OPTIMIZERS:
-            continue
-        _EMERGING_OPTIMIZERS[eopt_name] = EmergingOptimizerEntry(
-            optimizer_cls=registry.get_optimizer_cls(eopt_name),
-            init_state_fn=_eopt_init_state_fn,
-            config_to_kwargs=None,
-            default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
-            },
-        )

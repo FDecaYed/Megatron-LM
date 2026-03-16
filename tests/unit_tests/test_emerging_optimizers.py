@@ -11,7 +11,12 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
+from megatron.core.optimizer.emerging_optimizers import (
+    HAVE_EMERGING_OPTIMIZERS,
+    TensorParallelMuon,
+    _EMERGING_OPTIMIZERS,
+    _sync_emerging_optimizer_registry,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -672,6 +677,30 @@ def test_muon_optimizer_num_ns_steps(num_ns_steps):
 skip_no_soap = pytest.mark.skipif(
     not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package not installed"
 )
+
+
+@skip_no_soap
+def test_registry_sync_picks_up_newly_registered_optimizer():
+    """Ensure Megatron dynamically picks up optimizers registered after import."""
+    from emerging_optimizers import registry as eopt_registry
+
+    optimizer_name = "unit_test_dynamic_optimizer"
+    if optimizer_name in eopt_registry.get_optimizer_name_list():
+        pytest.skip(f"{optimizer_name} already present in shared test environment")
+
+    @eopt_registry.register_optimizer(optimizer_name)
+    class UnitTestDynamicOptimizer(torch.optim.Optimizer):
+        def __init__(self, params, lr=1e-3):
+            defaults = {"lr": lr}
+            super().__init__(params, defaults)
+
+        def step(self, closure=None):
+            return None
+
+    assert optimizer_name not in _EMERGING_OPTIMIZERS
+    _sync_emerging_optimizer_registry(optimizer_name)
+    assert optimizer_name in _EMERGING_OPTIMIZERS
+    assert _EMERGING_OPTIMIZERS[optimizer_name].optimizer_cls is UnitTestDynamicOptimizer
 
 
 @skip_no_soap
