@@ -19,6 +19,7 @@ from megatron.core.datasets.data_schedule_utils import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank as mtp_is_on_rank
 
 try:
     # Register the TE CUDA kernels
@@ -471,7 +472,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             num_to_move = multiple - remainder
             i = num_packed_sequence - 1
             while num_to_move > 0:
-                assert i > 0, "Not enough samples to move"
+                assert i >= 0, "Not enough samples to move"
                 if len(packed_id_groups[i]) > 1:
                     seq_id = packed_id_groups[i].pop()
                     packed_id_groups.append([seq_id])
@@ -530,35 +531,92 @@ class DpBalancedScheduler(BasePackingScheduler):
         """
 
         total_dcp_gpus = dp_cp_group.size()
+        is_first_pp_stage = pp_group.rank() == 0
+        is_last_pp_stage = pp_group.rank() == pp_group.size() - 1
+        mtp_on_this_pp_stage = mtp_is_on_rank(
+            layout=getattr(config, "pipeline_model_parallel_layout", None),
+            mtp_num_layers=getattr(config, "mtp_num_layers", None),
+            ignore_virtual=True,
+        )
+        needs_full_samples = is_first_pp_stage or is_last_pp_stage or mtp_on_this_pp_stage
+        vpp_needs_data = None
 
         # Handle VPP: extract the correct data_iterator for this PP stage
         if (
             config.virtual_pipeline_model_parallel_size is not None
             and config.virtual_pipeline_model_parallel_size > 1
         ):
-            # if enable VPP, data_iterator is a list of data_iterators for each VPP stage,
-            # and only the first and last stage rank will have data_iterator,
-            # other stages will have None.
+            # The schedule is identical for all virtual stages on this physical
+            # rank, so consume one local source iterator and create independent
+            # scheduled iterators below for stages that need full samples.
             assert len(data_iterator) == config.virtual_pipeline_model_parallel_size
-            if pp_group.rank() == 0:
-                # the first stage
-                data_iterator = data_iterator[0]
-            elif pp_group.rank() == pp_group.size() - 1:
-                # the last stage
-                data_iterator = data_iterator[-1]
-            else:
-                data_iterator = None
+            vpp_size = config.virtual_pipeline_model_parallel_size
+            vpp_needs_data = [False] * vpp_size
+            if is_first_pp_stage:
+                vpp_needs_data[0] = True
+            if is_last_pp_stage:
+                vpp_needs_data[-1] = True
+            if mtp_on_this_pp_stage:
+                for vp_stage in range(vpp_size):
+                    if mtp_is_on_rank(
+                        layout=getattr(config, "pipeline_model_parallel_layout", None),
+                        mtp_num_layers=getattr(config, "mtp_num_layers", None),
+                        ignore_virtual=False,
+                        vp_stage=vp_stage,
+                    ):
+                        vpp_needs_data[vp_stage] = True
 
-        # data_iterator is not None when TP rank 0, with PP stage 0 or -1.
+            data_iterator = (
+                next((iterator for iterator in data_iterator if iterator is not None), None)
+                if needs_full_samples
+                else None
+            )
+        elif not needs_full_samples:
+            # Ordinary middle PP stages consume metadata from the project-wide
+            # PP broadcast and do not run a duplicate local schedule.
+            data_iterator = None
+
+        # Probe one complete logical batch before entering any scheduling
+        # collective. Exhaustion can occur on only one data-owning rank; reduce
+        # that status over DPxCP, PP, and TP so every rank raises together
+        # instead of leaving peers blocked in a later collective.
+        prefetched_batches = []
+        has_complete_batch = torch.tensor(1, dtype=torch.int32, device=dev)
         if data_iterator is not None:
-            assert tp_group.rank() == 0 and (
-                pp_group.rank() == 0 or pp_group.rank() == pp_group.size() - 1
-            ), f"Only TP rank 0 and PP stage 0 or -1 should have data_iterator"
+            try:
+                prefetched_batches = [next(data_iterator) for _ in range(num_microbatches)]
+            except StopIteration:
+                has_complete_batch.zero_()
+            torch.distributed.all_reduce(
+                has_complete_batch, op=torch.distributed.ReduceOp.MIN, group=dp_cp_group
+            )
+
+        if tp_group.rank() == 0:
+            torch.distributed.all_reduce(
+                has_complete_batch, op=torch.distributed.ReduceOp.MIN, group=pp_group
+            )
+        (has_complete_batch_value,) = broadcast_scalars(
+            [has_complete_batch.item()], tp_group, dev, dtype=torch.int32
+        )
+        if not has_complete_batch_value:
+            raise StopIteration
+
+        # Full samples are scheduled only on TP rank 0 of a consuming PP stage.
+        if data_iterator is not None:
+            assert tp_group.rank() == 0 and needs_full_samples, (
+                "Only TP rank 0 on a first, last, or MTP pipeline stage should "
+                "schedule full samples"
+            )
 
             # Step 1: Fetch batches and gather global sequence lengths
-            batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
-                get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
-            )
+            (
+                batch,
+                global_id_seqlens,
+                global_ids_this_rank,
+                offsets,
+                _padded_seqlens_gathered,
+                original_seqlens_gathered,
+            ) = get_batch_and_global_seqlens(iter(prefetched_batches), num_microbatches, dp_group)
 
             # Step 2: Check required sample keys
             for key in self.get_required_sample_keys():
@@ -587,7 +645,6 @@ class DpBalancedScheduler(BasePackingScheduler):
                 sample_id_groups,
                 offsets,
                 dp_group,
-                tp_group,
                 dp_cp_group,
                 total_dcp_gpus,
             )
@@ -607,9 +664,9 @@ class DpBalancedScheduler(BasePackingScheduler):
             new_samples = build_packed_microbatches(grouped_samples, dev)
 
             # Step 6: Calculate FLOPs info
-            seqlen_sum_this_global_batch = float(sum(seqlens_gathered))
+            seqlen_sum_this_global_batch = float(sum(original_seqlens_gathered))
             seqlen_squared_sum_this_global_batch = float(
-                sum(seqlen**2 for seqlen in seqlens_gathered)
+                sum(seqlen**2 for seqlen in original_seqlens_gathered)
             )
         else:
             (
@@ -633,6 +690,7 @@ class DpBalancedScheduler(BasePackingScheduler):
                 seqlen_squared_sum_this_global_batch,
                 pp_group,
                 dev,
+                keep_local_full_samples=mtp_on_this_pp_stage,
             )
 
         # Step 8: Broadcast to TP group (for non-TP-0 ranks)
@@ -650,7 +708,9 @@ class DpBalancedScheduler(BasePackingScheduler):
         num_micro_batches = int(num_micro_batches)
 
         # Step 9: create data_iterator and handle VPP if enabled
-        new_data_iterator = create_data_iterator(new_samples, pp_group, tp_group, config)
+        new_data_iterator = create_data_iterator(
+            new_samples, pp_group, tp_group, config, vpp_needs_data=vpp_needs_data
+        )
 
         return (
             new_data_iterator,
@@ -672,7 +732,7 @@ scheduler_map: Dict[PackingSchedulerEnum, Type[BasePackingScheduler]] = {
 
 
 def wrap_data_iterator(
-    data_iterator, config, num_microbatches, pg_collection: Optional[ProcessGroupCollection] = None
+    data_iterator, config, num_microbatches, pg_collection: ProcessGroupCollection
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -681,20 +741,13 @@ def wrap_data_iterator(
     Args:
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
-        dp_cp_group: Data parallel context parallel group.
         pg_collection: The process group collection.
     """
 
-    if pg_collection is None:
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        dp_group = parallel_state.get_data_parallel_group()
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-    else:
-        dp_cp_group = pg_collection.dp_cp
-        dp_group = pg_collection.dp
-        tp_group = pg_collection.tp
-        pp_group = pg_collection.pp
+    dp_cp_group = pg_collection.dp_cp
+    dp_group = pg_collection.dp
+    tp_group = pg_collection.tp
+    pp_group = pg_collection.pp
     assert (
         dp_cp_group is not None
         and dp_group is not None
@@ -741,30 +794,27 @@ def wrap_data_iterator(
 
 def get_batch_on_this_rank_for_sequence_packing(
     data_iterator,
+    pg_collection: ProcessGroupCollection,
     vpp_size: Optional[int] = None,
     mtp_on_this_rank: bool = False,
     vp_stage: Optional[int] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """
     Get a batch of data for sequence packing.
     Args:
         data_iterator (Iterator): The data iterator to get the batch from.
+        pg_collection: The process groups owned by the model using this batch.
+        vpp_size (Optional[int]): Number of virtual pipeline stages when VPP is enabled.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
-        vp_stage (Optional[int]): The stage of the pipeline.
+        vp_stage (Optional[int]): Current virtual pipeline stage.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
     """
 
-    if pg_collection is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
-    else:
-        tp_group = pg_collection.tp
-        pp_group = pg_collection.pp
-        cp_group = pg_collection.cp
+    tp_group = pg_collection.tp
+    pp_group = pg_collection.pp
+    cp_group = pg_collection.cp
 
     tp_src_rank = torch.distributed.get_process_group_ranks(tp_group)[0]
 
@@ -774,15 +824,14 @@ def get_batch_on_this_rank_for_sequence_packing(
         vp_stage is None or vp_stage == vpp_size - 1
     )
 
-    is_first_or_last_stage = is_first_stage or is_last_stage
     dev = torch.cuda.current_device()
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
-    if is_first_stage:
+    if is_first_stage or mtp_on_this_rank:
         batch_keys.append('tokens')
         batch_keys.append('position_ids')
-    if is_last_stage:
+    if is_last_stage or mtp_on_this_rank:
         batch_keys.append('labels')
         batch_keys.append('loss_mask')
 
@@ -821,8 +870,10 @@ def get_batch_on_this_rank_for_sequence_packing(
             ), "Transformer Engine is required to use Context Parallel with THD format data."
             index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             cp_slice_keys = ['padding_mask']
-            if is_first_or_last_stage:
-                cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
+            if is_first_stage or mtp_on_this_rank:
+                cp_slice_keys.extend(['tokens', 'position_ids'])
+            if is_last_stage or mtp_on_this_rank:
+                cp_slice_keys.extend(['labels', 'loss_mask'])
             for key in cp_slice_keys:
                 batch[key] = batch[key].index_select(0, index)
 
@@ -851,7 +902,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['position_ids'] = None
 
     # Step2: Prepare "labels", "loss_mask" on all ranks.
-    if is_last_stage:
+    if is_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             assert batch['labels'].dtype == torch.int64
             assert batch['loss_mask'].dtype == torch.float32
@@ -908,13 +959,12 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
 
-    # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
-    # get the correct result.
-    # TODO: Revert this workaround once TE fixes the issue.
+    # Preserve original boundaries for loss paths while attention and THD
+    # partitioning continue to consume the padded boundaries.
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,

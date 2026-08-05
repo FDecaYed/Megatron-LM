@@ -104,49 +104,70 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     return batch_unpacked
 
 
-def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
+def _gather_global_seqlens(local_seqlens: torch.Tensor, dp_group):
+    """Gather aligned sequence-length columns across a DP process group.
+
+    Args:
+        local_seqlens: Two-dimensional tensor whose rows are local samples and whose
+            columns are aligned length variants, such as padded and original lengths.
+        dp_group: Data-parallel process group used for the gather.
+
+    Returns:
+        The concatenated CPU tensor in DP-rank order and per-rank row offsets into it.
     """
-    Gathers the sequence lengths of all subsamples from all DP ranks and calculates global IDs.
-    """
+    assert local_seqlens.dim() == 2
+
     # Collect the number of subsamples from all ranks
-    num_local_subsamples = subsample_seqlens.shape[0]
-    local_len = torch.tensor([num_local_subsamples], dtype=torch.int32).cuda()
+    num_local_subsamples = local_seqlens.shape[0]
+    local_len = torch.tensor([num_local_subsamples], dtype=torch.int32, device=local_seqlens.device)
     dp_subsample_count = [torch.zeros_like(local_len) for _ in range(dp_group.size())]
     torch.distributed.all_gather(dp_subsample_count, local_len, group=dp_group)
 
-    # Find the max number of subsamples across all ranks and pad subsample_seqlens to max length
+    # Find the max number of subsamples across all ranks and pad to that length.
     dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
     max_sub_samples = int(dp_subsample_counts.max().item())
 
     if num_local_subsamples < max_sub_samples:
-        subsample_seqlens_padded = torch.cat(
+        local_seqlens = torch.cat(
             [
-                subsample_seqlens,
-                torch.zeros(max_sub_samples - num_local_subsamples, dtype=torch.int32).cuda(),
+                local_seqlens,
+                torch.zeros(
+                    (max_sub_samples - num_local_subsamples, local_seqlens.shape[1]),
+                    dtype=local_seqlens.dtype,
+                    device=local_seqlens.device,
+                ),
             ],
             dim=0,
         )
-    else:
-        subsample_seqlens_padded = subsample_seqlens
 
-    # Gather the subsample_seqlens from all ranks
-    seqlens_gathered = [torch.empty_like(subsample_seqlens_padded) for _ in range(dp_group.size())]
-    torch.distributed.all_gather(seqlens_gathered, subsample_seqlens_padded, group=dp_group)
+    seqlens_gathered = [torch.empty_like(local_seqlens) for _ in range(dp_group.size())]
+    torch.distributed.all_gather(seqlens_gathered, local_seqlens, group=dp_group)
 
-    # Trim each seqlens_gathered to the length of the correct sample
+    # Trim each rank to its real number of samples.
     for dp_rank, seqlen in enumerate(seqlens_gathered):
-        seqlens_gathered[dp_rank] = seqlen[: dp_subsample_counts[dp_rank]]
+        seqlens_gathered[dp_rank] = seqlen[: int(dp_subsample_counts[dp_rank].item())]
 
-    seqlens_gathered = torch.cat(seqlens_gathered, dim=0)
-    seqlens_gathered = seqlens_gathered.cpu().tolist()
+    seqlens_gathered = torch.cat(seqlens_gathered, dim=0).cpu()
 
     # Calculate the offsets to assign unique global ID to each subsample.
     csum = torch.cumsum(dp_subsample_counts, dim=0, dtype=torch.int32)
     offsets = torch.cat([torch.zeros(1, dtype=torch.int32), csum], dim=0)
 
+    return seqlens_gathered, offsets
+
+
+def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
+    """
+    Gathers the sequence lengths of all subsamples from all DP ranks and calculates global IDs.
+    """
+    seqlens_gathered, offsets = _gather_global_seqlens(subsample_seqlens.reshape(-1, 1), dp_group)
+    seqlens_gathered = seqlens_gathered[:, 0].tolist()
+
     # Calculate global ID for each subsample
     dp_rank = dp_group.rank()
-    global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
+    global_ids = torch.arange(
+        len(seqlens_gathered), dtype=torch.int32, device=subsample_seqlens.device
+    )
 
     # Create a list of (global_id, seqlen) tuples for scheduling
     global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
@@ -158,6 +179,44 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
     global_ids_this_rank = global_ids[start_idx:end_idx]
 
     return global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
+
+
+def _get_global_padded_and_original_seqlens_and_ids(
+    padded_subsample_seqlens: torch.Tensor, original_subsample_seqlens: torch.Tensor, dp_group
+):
+    """Gather padded and original lengths in one collective ordering.
+
+    Args:
+        padded_subsample_seqlens: Local padded length for each unpacked sample.
+        original_subsample_seqlens: Local unpadded length for the same samples.
+        dp_group: Data-parallel process group used for the gather.
+
+    Returns:
+        Scheduling tuples based on padded lengths, locally owned global IDs, per-rank
+        offsets, and globally ordered padded and original length lists.
+    """
+    assert padded_subsample_seqlens.shape == original_subsample_seqlens.shape
+    local_seqlens = torch.stack([padded_subsample_seqlens, original_subsample_seqlens], dim=1)
+    seqlens_gathered, offsets = _gather_global_seqlens(local_seqlens, dp_group)
+    padded_seqlens_gathered = seqlens_gathered[:, 0].tolist()
+    original_seqlens_gathered = seqlens_gathered[:, 1].tolist()
+
+    dp_rank = dp_group.rank()
+    global_ids = torch.arange(
+        len(padded_seqlens_gathered), dtype=torch.int32, device=padded_subsample_seqlens.device
+    )
+    global_id_seqlens = [
+        (i, padded_seqlens_gathered[i]) for i in range(len(padded_seqlens_gathered))
+    ]
+    global_ids_this_rank = global_ids[offsets[dp_rank] : offsets[dp_rank + 1]]
+
+    return (
+        global_id_seqlens,
+        global_ids_this_rank,
+        offsets,
+        padded_seqlens_gathered,
+        original_seqlens_gathered,
+    )
 
 
 def _pack_sequences(
@@ -212,6 +271,7 @@ def broadcast_to_pp_group(
     seqlen_squared_sum_this_global_batch,
     pp_group,
     dev,
+    keep_local_full_samples=False,
 ):
     """
     Broadcast num_micro_batches, seqlen_sum_this_global_batch,
@@ -219,6 +279,16 @@ def broadcast_to_pp_group(
     Before this broadcast, the new_samples on middle PP stages are None,
     after this broadcast, the new_samples on middle PP stages contain the metadata but
     without tokens, labels, loss_mask, position_ids.
+
+    Args:
+        new_samples: Packed samples built on PP stages that own data.
+        num_micro_batches: Number of packed microbatches.
+        seqlen_sum_this_global_batch: Sum of original sequence lengths.
+        seqlen_squared_sum_this_global_batch: Sum of squared original sequence lengths.
+        pp_group: Pipeline-parallel process group.
+        dev: Device used for the broadcast buffers.
+        keep_local_full_samples: Keep locally scheduled token fields on an MTP middle stage
+            while still participating in the PP metadata broadcast.
 
     Who needs what:
 
@@ -228,10 +298,10 @@ def broadcast_to_pp_group(
         with complete ``new_samples``: tokens, labels, loss_mask, position_ids *and*
         the packing metadata. Neither takes anything from this broadcast; the last
         stage in particular must keep its own labels / loss_mask.
-      * **Middle PP stages** have no data iterator, so ``new_samples`` is None on
-        entry. They only need the packing metadata (max_seqlen / cu_seqlens /
-        cu_seqlens_padded) to rebuild the packed-sequence params, never the token
-        tensors.
+      * **Middle PP stages** normally have no data iterator, so ``new_samples`` is
+        None on entry. They only need packing metadata. A middle stage that owns
+        MTP layers schedules locally, participates in the same collective, and
+        keeps its complete local samples when ``keep_local_full_samples`` is true.
 
     The last PP rank still takes part in the transfer because
     ``torch.distributed.broadcast`` is a collective over ``pp_group``: every member
@@ -316,21 +386,22 @@ def broadcast_to_pp_group(
                 ].to(torch.int64)
                 cursor += num_micro_batches
 
-                new_samples = []
-                for i in range(num_micro_batches):
-                    cu_seqlens_len = int(cu_seqlens_lengths[i].item())
-                    cu_seqlens_padded_len = int(cu_seqlens_padded_lengths[i].item())
-                    new_sample = {}
-                    new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
-                    new_sample["cu_seqlens"] = info_to_broadcast[
-                        cursor : cursor + cu_seqlens_len
-                    ].to(torch.int32)
-                    cursor += cu_seqlens_len
-                    new_sample["cu_seqlens_padded"] = info_to_broadcast[
-                        cursor : cursor + cu_seqlens_padded_len
-                    ].to(torch.int32)
-                    cursor += cu_seqlens_padded_len
-                    new_samples.append(new_sample)
+                if not keep_local_full_samples:
+                    new_samples = []
+                    for i in range(num_micro_batches):
+                        cu_seqlens_len = int(cu_seqlens_lengths[i].item())
+                        cu_seqlens_padded_len = int(cu_seqlens_padded_lengths[i].item())
+                        new_sample = {}
+                        new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
+                        new_sample["cu_seqlens"] = info_to_broadcast[
+                            cursor : cursor + cu_seqlens_len
+                        ].to(torch.int32)
+                        cursor += cu_seqlens_len
+                        new_sample["cu_seqlens_padded"] = info_to_broadcast[
+                            cursor : cursor + cu_seqlens_padded_len
+                        ].to(torch.int32)
+                        cursor += cu_seqlens_padded_len
+                        new_samples.append(new_sample)
 
     return (
         new_samples,
@@ -372,31 +443,38 @@ def broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:
     return values
 
 
-def create_data_iterator(new_samples, pp_group, tp_group, config):
-    """Handle virtual pipeline parallelism."""
+def create_data_iterator(new_samples, pp_group, tp_group, config, vpp_needs_data=None):
+    """Create iterators for physical and virtual pipeline stages.
+
+    Args:
+        new_samples: Packed samples, or metadata-only samples on ordinary middle PP stages.
+        pp_group: Pipeline-parallel process group.
+        tp_group: Tensor-parallel process group.
+        config: Model-parallel configuration containing the VPP size.
+        vpp_needs_data: Optional bool list selecting VP stages that retain full samples.
+    """
     if (
         config.virtual_pipeline_model_parallel_size is not None
         and config.virtual_pipeline_model_parallel_size > 1
     ):
         vpp_size = config.virtual_pipeline_model_parallel_size
         if tp_group.rank() == 0:
-            if pp_group.rank() == 0 or pp_group.rank() == pp_group.size() - 1:
-                metadata = [
-                    {k: sample[k] for k in ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]}
-                    for sample in new_samples
-                ]
+            metadata = [
+                {k: sample[k] for k in ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]}
+                for sample in new_samples
+            ]
+            if vpp_needs_data is None:
+                vpp_needs_data = [False] * vpp_size
                 if pp_group.rank() == 0:
-                    new_data_iterator = [RerunDataIterator(iter(new_samples))] + [
-                        RerunDataIterator(iter(metadata)) for _ in range(vpp_size - 1)
-                    ]
-                else:
-                    new_data_iterator = [
-                        RerunDataIterator(iter(metadata)) for _ in range(vpp_size - 1)
-                    ] + [RerunDataIterator(iter(new_samples))]
-            else:
-                # on middle PP stages, the new_samples are the metadata
-                metadata = new_samples
-                new_data_iterator = [RerunDataIterator(iter(metadata)) for _ in range(vpp_size)]
+                    vpp_needs_data[0] = True
+                if pp_group.rank() == pp_group.size() - 1:
+                    vpp_needs_data[-1] = True
+
+            assert len(vpp_needs_data) == vpp_size
+            new_data_iterator = []
+            for needs_data in vpp_needs_data:
+                samples = [dict(sample) for sample in (new_samples if needs_data else metadata)]
+                new_data_iterator.append(RerunDataIterator(iter(samples)))
         else:
             new_data_iterator = [None for _ in range(vpp_size)]
     else:
@@ -412,7 +490,6 @@ def reroute_samples_to_dcp_ranks(
     sample_id_groups,
     offsets,
     dp_group,
-    tp_group,
     dp_cp_group,
     total_dcp_gpus,
 ):
@@ -421,19 +498,28 @@ def reroute_samples_to_dcp_ranks(
 
     For each key in the batch dict, we perform an all-to-all communication
     to transfer the data to the correct ranks.
+
+    The DP group is a subset of the corresponding DPxCP group. Mapping through their
+    actual global-rank membership avoids assuming any arithmetic rank layout.
     """
 
+    dp_global_ranks = torch.distributed.get_process_group_ranks(dp_group)
+    dp_cp_global_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+    global_to_dcp_rank = {global_rank: rank for rank, global_rank in enumerate(dp_cp_global_ranks)}
+    missing_dp_ranks = [rank for rank in dp_global_ranks if rank not in global_to_dcp_rank]
+    assert not missing_dp_ranks, (
+        "The DP process group must be a subset of the corresponding DPxCP process group; "
+        f"missing={missing_dp_ranks}, dp_ranks={dp_global_ranks}, "
+        f"dp_cp_ranks={dp_cp_global_ranks}"
+    )
+
     def _gid_to_src_rank(gid: int) -> int:
-        dp_src_rank = torch.bucketize(gid, offsets[1:] - 1)
-        dcp_rank = (
-            torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank] // tp_group.size()
-        ) % dp_cp_group.size()
-        return dcp_rank
+        dp_src_rank = int(torch.bucketize(gid, offsets[1:] - 1).item())
+        return global_to_dcp_rank[dp_global_ranks[dp_src_rank]]
 
     gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
     dcp_rank = dp_cp_group.rank()
-    dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
-    dp_ranks = [(r // tp_group.size()) % dp_cp_group.size() for r in dp_ranks]
+    dp_ranks = [global_to_dcp_rank[global_rank] for global_rank in dp_global_ranks]
 
     data_keys = batch[0].keys()
 
@@ -488,7 +574,7 @@ def reroute_samples_to_dcp_ranks(
         return (
             torch.cat(flattened_tensors, dim=0)
             if flattened_tensors
-            else torch.empty(1, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
+            else torch.empty(0, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
         )
 
     def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):
@@ -580,10 +666,11 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
             global IDs ``offsets[r]:offsets[r + 1]``. Used by
             :func:`reroute_samples_to_dcp_ranks` to map a global ID back to its source
             rank.
-        seqlens_gathered (List[int]): Padded sequence length of every sub-sample in the
+        padded_seqlens_gathered (List[int]): Padded sequence length of every sub-sample in the
             DP group, indexed by global ID (``seqlens_gathered[gid]`` equals
-            ``global_id_seqlens[gid][1]``). Handy for global-batch token counts such as
-            the FLOPs accounting.
+            ``global_id_seqlens[gid][1]``).
+        original_seqlens_gathered (List[int]): Original sequence length of every
+            sub-sample in the same ordering. Used for token and FLOPs accounting.
     """
 
     batch_list = [next(data_iterator) for _ in range(num_microbatches)]
@@ -604,12 +691,28 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     # and this step can be skipped.
     batch = _unpack_batch(batch)
 
-    subsample_seqlens = torch.cat([sample["padded_seq_len"] for sample in batch]).to(
+    padded_subsample_seqlens = torch.cat([sample["padded_seq_len"] for sample in batch]).to(
+        dtype=torch.int32, device=torch.cuda.current_device()
+    )
+    original_subsample_seqlens = torch.cat([sample["original_seq_len"] for sample in batch]).to(
         dtype=torch.int32, device=torch.cuda.current_device()
     )
 
-    global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
-        _get_global_seqlens_and_ids(subsample_seqlens, dp_group)
+    (
+        global_id_seqlens,
+        global_ids_this_rank,
+        offsets,
+        padded_seqlens_gathered,
+        original_seqlens_gathered,
+    ) = _get_global_padded_and_original_seqlens_and_ids(
+        padded_subsample_seqlens, original_subsample_seqlens, dp_group
     )
 
-    return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
+    return (
+        batch,
+        global_id_seqlens,
+        global_ids_this_rank,
+        offsets,
+        padded_seqlens_gathered,
+        original_seqlens_gathered,
+    )

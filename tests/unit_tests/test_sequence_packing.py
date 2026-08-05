@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import random
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,14 +8,24 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
+    DpBalancedScheduler,
     _build_thd_padding_mask,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.datasets.data_schedule_utils import reroute_samples_to_dcp_ranks
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
+
+
+def _scheduler_pg_collection():
+    """Build the process groups consumed by the packing scheduler."""
+    return ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'pp', 'cp', 'dp', 'dp_cp']
+    )
 
 
 def test_scheduler_thd_padding_mask_from_cu_seqlens():
@@ -45,6 +54,128 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+def test_packed_batch_preserves_original_and_padded_cu_seqlens():
+    Utils.initialize_model_parallel(1, 1)
+
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        tokens = torch.arange(8, dtype=torch.int64, device=device)
+        batch = {
+            'tokens': tokens,
+            'labels': tokens + 1,
+            'loss_mask': torch.ones(8, dtype=torch.float32, device=device),
+            'position_ids': torch.arange(8, dtype=torch.int64, device=device),
+            'cu_seqlens': torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
+            'cu_seqlens_padded': torch.tensor([0, 4, 8], dtype=torch.int32, device=device),
+            'max_seqlen': torch.tensor([4], dtype=torch.int32, device=device),
+        }
+
+        *_, packed_seq_params, padding_mask = get_batch_on_this_rank_for_sequence_packing(
+            iter([batch]), pg_collection=_scheduler_pg_collection()
+        )
+
+        torch.testing.assert_close(packed_seq_params.cu_seqlens_q, batch['cu_seqlens'])
+        torch.testing.assert_close(
+            packed_seq_params.cu_seqlens_q_padded, batch['cu_seqlens_padded']
+        )
+        assert torch.equal(
+            padding_mask,
+            torch.tensor([[False, False, False, True, False, False, True, True]], device=device),
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_dp_balanced_scheduler_can_split_group_zero():
+    scheduler = DpBalancedScheduler(
+        max_seqlen_per_dp_cp_rank=8, cp_size=1, dp_size=2, microbatch_group_size_per_vp_stage=None
+    )
+
+    assert scheduler.get_groups_and_subsamples([(0, 2), (1, 2)]) == [[[0], [1]]]
+
+
+class _FakeProcessGroup:
+    """Minimal process-group surface used by reroute planning tests."""
+
+    def __init__(self, global_ranks, local_rank):
+        self.global_ranks = global_ranks
+        self.local_rank = local_rank
+
+    def rank(self):
+        return self.local_rank
+
+    def size(self):
+        return len(self.global_ranks)
+
+
+def _patch_reroute_collectives(monkeypatch):
+    """Replace collectives while preserving all-to-all split validation."""
+    calls = []
+
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda group: group.global_ranks
+    )
+
+    def _all_to_all_single(output, input, output_split_sizes, input_split_sizes, group):
+        assert input.numel() == sum(input_split_sizes)
+        assert output.numel() == sum(output_split_sizes)
+        assert input.numel() == output.numel()
+        output.copy_(input)
+        calls.append((list(output_split_sizes), list(input_split_sizes), input.numel()))
+
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", _all_to_all_single)
+    return calls
+
+
+def _reroute_test_inputs(destination_groups):
+    """Build one local sample with deliberately non-arithmetic group ranks."""
+    device = torch.device("cpu")
+    batch = [
+        {
+            "tokens": torch.tensor([7, 8], dtype=torch.int64, device=device),
+            "original_seq_len": torch.tensor([2], dtype=torch.int32, device=device),
+            "padded_seq_len": torch.tensor([2], dtype=torch.int32, device=device),
+        }
+    ]
+    return {
+        "batch": batch,
+        "global_ids_this_rank": torch.tensor([0], dtype=torch.int32, device=device),
+        "global_id_seqlens": [(0, 2), (1, 2)],
+        "sample_id_groups": [destination_groups],
+        "offsets": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "dp_group": _FakeProcessGroup([11, 29], local_rank=0),
+        "dp_cp_group": _FakeProcessGroup([5, 11, 17, 29], local_rank=1),
+        "total_dcp_gpus": 4,
+    }
+
+
+def test_reroute_uses_process_group_membership(monkeypatch):
+    calls = _patch_reroute_collectives(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    inputs = _reroute_test_inputs([[], [0], [], [1]])
+
+    received = reroute_samples_to_dcp_ranks(**inputs)
+
+    assert list(received) == [0]
+    torch.testing.assert_close(received[0]["tokens"], inputs["batch"][0]["tokens"])
+    assert calls == [
+        ([0, 2, 0, 0], [0, 2, 0, 0], 2),
+        ([0, 1, 0, 0], [0, 1, 0, 0], 1),
+        ([0, 1, 0, 0], [0, 1, 0, 0], 1),
+    ]
+
+
+def test_reroute_allows_zero_length_send_buffer(monkeypatch):
+    calls = _patch_reroute_collectives(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    inputs = _reroute_test_inputs([[0], [], [1], []])
+
+    received = reroute_samples_to_dcp_ranks(**inputs)
+
+    assert received == {}
+    assert calls == [([0, 0, 0, 0], [0, 0, 0, 0], 0)] * 3
 
 
 class MockVariableLengthSequencePackingDataIterator:
@@ -223,7 +354,10 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
 
         # Call the function under test
         result = get_batch_on_this_rank_for_sequence_packing(
-            data_iterator=data_iterator, mtp_on_this_rank=False, vp_stage=None
+            data_iterator=data_iterator,
+            pg_collection=_scheduler_pg_collection(),
+            mtp_on_this_rank=False,
+            vp_stage=None,
         )
 
         # Unpack the result. Scheduler THD always returns padding_mask.
@@ -336,16 +470,17 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
 
 
 @pytest.mark.parametrize(
-    ("tp", "pp", "cp", "vpp", "scheduler_type"),
+    ("tp", "pp", "cp", "vpp", "scheduler_type", "mtp_vpp"),
     [
-        (1, 1, 8, None, "dp_balanced"),
-        (2, 1, 4, None, "dp_balanced"),
-        (2, 4, 1, None, "dp_balanced"),
-        (2, 2, 1, None, "dp_balanced"),
-        (1, 4, 1, 4, "dp_balanced"),
+        (1, 1, 8, None, "dp_balanced", False),
+        (2, 1, 4, None, "dp_balanced", False),
+        (2, 4, 1, None, "dp_balanced", False),
+        (2, 2, 1, None, "dp_balanced", False),
+        (1, 4, 1, 4, "dp_balanced", False),
+        (1, 4, 1, 4, "dp_balanced", True),
     ],
 )
-def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
+def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type, mtp_vpp, monkeypatch):
     '''
     Test wrap_dataloader function with different scheduler types.
     '''
@@ -388,13 +523,16 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
 
     global_batch_size = 64
     micro_batch_size = 1
-    nums = [random.randint(2048, args.seq_length) for _ in range(global_batch_size)]  # 64 sequences
+    sequence_lengths = [2048, 3072, 4096, 5120, 6144, 7168, 8192, 2560]
+    nums = [sequence_lengths[i % len(sequence_lengths)] for i in range(global_batch_size)]
 
     config = SimpleNamespace()
     config.max_seqlen_per_dp_cp_rank = args.max_seqlen_per_dp_cp_rank
     config.microbatch_group_size_per_vp_stage = pp
     config.virtual_pipeline_model_parallel_size = vpp
     config.sequence_packing_scheduler = scheduler_type
+    config.pipeline_model_parallel_layout = object() if mtp_vpp else None
+    config.mtp_num_layers = 1 if mtp_vpp else None
 
     dp_rank = parallel_state.get_data_parallel_rank()
     dp_size = parallel_state.get_data_parallel_world_size()
@@ -407,9 +545,21 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     is_pp_first_or_last = is_pp_first or is_pp_last
     is_tp_first = tp_rank == 0
 
+    mtp_pp_rank = 1
+    mtp_vp_stage = 2
+    is_mtp_pp_stage = mtp_vpp and pp_rank == mtp_pp_rank
+    if mtp_vpp:
+
+        def _mock_mtp_on_this_rank(*, ignore_virtual, vp_stage=None, **_kwargs):
+            return is_mtp_pp_stage and (ignore_virtual or vp_stage == mtp_vp_stage)
+
+        monkeypatch.setattr(
+            "megatron.core.datasets.data_schedule.mtp_is_on_rank", _mock_mtp_on_this_rank
+        )
+
     num_micro_batches_old = global_batch_size // micro_batch_size // dp_size
 
-    if is_tp_first and (is_pp_first or is_pp_last):
+    if is_tp_first:
         samples = [
             _create_single_sample(num)
             for num in nums[dp_rank * num_micro_batches_old : (dp_rank + 1) * num_micro_batches_old]
@@ -424,8 +574,13 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 data_iterator = [data_iterator] + [None for _ in range(vpp - 1)]
             elif is_pp_last:
                 data_iterator = [None for _ in range(vpp - 1)] + [data_iterator]
-            else:
+            elif is_mtp_pp_stage:
                 data_iterator = [None for _ in range(vpp)]
+                data_iterator[mtp_vp_stage] = RerunDataIterator(iter(samples))
+            else:
+                # Packed/SFT providers can build iterators on every VP stage;
+                # ordinary middle PP stages must ignore those full-data sources.
+                data_iterator = [RerunDataIterator(iter(samples)) for _ in range(vpp)]
     try:
         # Call the function under test
         (
@@ -433,7 +588,9 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             num_micro_batches,
             num_total_tokens_this_global_batch,
             sequence_square_sum_this_global_batch,
-        ) = wrap_data_iterator(data_iterator, config, num_micro_batches_old)
+        ) = wrap_data_iterator(
+            data_iterator, config, num_micro_batches_old, _scheduler_pg_collection()
+        )
 
         # check the result
         assert type(num_micro_batches) is int
@@ -446,36 +603,64 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             or type(sequence_square_sum_this_global_batch) is np.float32
         )
 
-        def _check_batch(batch_all, batch_keys):
+        metadata_keys = {"cu_seqlens", "max_seqlen", "cu_seqlens_padded"}
+        full_sample_keys = metadata_keys | {"tokens", "position_ids", "labels", "loss_mask"}
+
+        def _check_batch(batch_all, expected_keys):
             for batch in batch_all:
-                assert set(batch_keys) <= set(
-                    batch.keys()
-                ), f"batch keys: {set(batch.keys())} missing {set(batch_keys) - set(batch.keys())}"
-                for key in batch_keys:
+                assert set(batch) == expected_keys, (
+                    f"batch keys: {set(batch)}; expected exactly: {expected_keys}; "
+                    f"missing: {expected_keys - set(batch)}; extra: {set(batch) - expected_keys}"
+                )
+                for key in expected_keys:
                     assert batch[key] is not None
 
         if is_tp_first:
             # CHECK KEYS
-            batch_keys = ["cu_seqlens", "max_seqlen", "cu_seqlens_padded"]
             if vpp is not None and vpp > 1:
-                # check metadata for all stages (save batches to avoid re-consuming iterators)
+                # Save each VP stage's batches so exact stage ownership and
+                # token conservation can be checked without re-consuming iterators.
                 all_stage_batches = []
-                for temp_data_iterator in new_data_iterator:
+                for vp_stage, temp_data_iterator in enumerate(new_data_iterator):
                     stage_batch = [next(temp_data_iterator) for _ in range(num_micro_batches)]
                     all_stage_batches.append(stage_batch)
-                    _check_batch(stage_batch, batch_keys)
+                    needs_full_samples = (
+                        (is_pp_first and vp_stage == 0)
+                        or (is_pp_last and vp_stage == vpp - 1)
+                        or (is_mtp_pp_stage and vp_stage == mtp_vp_stage)
+                    )
+                    _check_batch(
+                        stage_batch, full_sample_keys if needs_full_samples else metadata_keys
+                    )
 
-                # check for first or last stage on first or last pp rank
                 if is_pp_first_or_last:
                     batch_all = all_stage_batches[0] if is_pp_first else all_stage_batches[-1]
-                    batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
-                    _check_batch(batch_all, batch_keys)
+                elif is_mtp_pp_stage:
+                    batch_all = all_stage_batches[mtp_vp_stage]
+
+                    mtp_batch = {
+                        key: value.clone() if torch.is_tensor(value) else value
+                        for key, value in batch_all[0].items()
+                    }
+                    tokens, labels, loss_mask, _, position_ids, packed_params, padding_mask = (
+                        get_batch_on_this_rank_for_sequence_packing(
+                            iter([mtp_batch]),
+                            pg_collection=_scheduler_pg_collection(),
+                            vpp_size=vpp,
+                            mtp_on_this_rank=True,
+                            vp_stage=mtp_vp_stage,
+                        )
+                    )
+                    assert tokens is not None
+                    assert labels is not None
+                    assert loss_mask is not None
+                    assert position_ids is not None
+                    assert packed_params.qkv_format == "thd"
+                    assert padding_mask is not None
             else:
                 # non-VPP: single iterator
                 batch_all = [next(new_data_iterator) for _ in range(num_micro_batches)]
-                if is_pp_first_or_last:
-                    batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
-                _check_batch(batch_all, batch_keys)
+                _check_batch(batch_all, full_sample_keys if is_pp_first_or_last else metadata_keys)
 
             # CHECK TOKEN SUM ON FIRST OR LAST PP RANK
             # Note: data_iterator is consumed by wrap_data_iterator, new_data_iterator is consumed above.
@@ -512,6 +697,99 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             else:
                 assert new_data_iterator is None
 
+    finally:
+        Utils.destroy_model_parallel()
+        unset_global_variables()
+
+
+@pytest.mark.parametrize(("tp", "pp"), [(2, 2), (1, 4)])
+def test_wrap_data_iterator_propagates_stop_iteration(tp, pp):
+    """All ranks stop when one owner exhausts a partial logical batch."""
+    Utils.initialize_model_parallel(tp, pp)
+
+    try:
+        dp_rank = parallel_state.get_data_parallel_rank()
+        is_data_owner = parallel_state.get_tensor_model_parallel_rank() == 0 and (
+            parallel_state.is_pipeline_first_stage() or parallel_state.is_pipeline_last_stage()
+        )
+        data_iterator = None
+        if is_data_owner:
+            sample = {"unused": torch.tensor(0)}
+            # Only DP rank 0 on the first physical PP stage exhausts after
+            # yielding one item. Every other owner has a complete logical
+            # batch. The scheduler must collectively choose EOF without
+            # entering routing or consuming a second global batch.
+            if dp_rank == 0 and parallel_state.is_pipeline_first_stage():
+                data_iterator = iter([sample])
+            else:
+                data_iterator = iter([sample, sample])
+
+        config = SimpleNamespace(
+            max_seqlen_per_dp_cp_rank=8,
+            microbatch_group_size_per_vp_stage=None,
+            virtual_pipeline_model_parallel_size=None,
+            sequence_packing_scheduler="dp_balanced",
+            pipeline_model_parallel_layout=None,
+            mtp_num_layers=None,
+        )
+        with pytest.raises(StopIteration):
+            wrap_data_iterator(data_iterator, config, 2, _scheduler_pg_collection())
+    finally:
+        Utils.destroy_model_parallel()
+        unset_global_variables()
+
+
+def test_wrapped_batch_with_pipeline_and_context_parallel():
+    """Exercise PP-aware routing, original FLOPs, and CP slicing together."""
+    Utils.initialize_model_parallel(1, 2, None, context_parallel_size=2)
+
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        dp_rank = parallel_state.get_data_parallel_rank()
+        tokens = torch.arange(16, dtype=torch.int64, device=device) + dp_rank * 100
+        sample = {
+            'tokens': tokens,
+            'labels': tokens + 1,
+            'loss_mask': torch.ones(16, dtype=torch.float32, device=device),
+            'position_ids': torch.arange(16, dtype=torch.int64, device=device),
+            'original_seq_len': torch.tensor([12], dtype=torch.int32, device=device),
+            'padded_seq_len': torch.tensor([16], dtype=torch.int32, device=device),
+        }
+        config = SimpleNamespace(
+            max_seqlen_per_dp_cp_rank=8,
+            microbatch_group_size_per_vp_stage=None,
+            virtual_pipeline_model_parallel_size=None,
+            sequence_packing_scheduler="dp_balanced",
+            pipeline_model_parallel_layout=None,
+            mtp_num_layers=None,
+        )
+
+        packed_iterator, num_microbatches, token_sum, squared_sum = wrap_data_iterator(
+            RerunDataIterator(iter([sample])), config, 1, _scheduler_pg_collection()
+        )
+        assert num_microbatches == 1
+        assert token_sum == 24.0
+        assert squared_sum == 288.0
+
+        tokens, labels, loss_mask, _, position_ids, packed_seq_params, padding_mask = (
+            get_batch_on_this_rank_for_sequence_packing(
+                packed_iterator, pg_collection=_scheduler_pg_collection()
+            )
+        )
+        is_first = parallel_state.is_pipeline_first_stage()
+        assert (tokens is not None) == is_first
+        assert (position_ids is not None) == is_first
+        assert (labels is None) == is_first
+        assert (loss_mask is None) == is_first
+        assert packed_seq_params.qkv_format == "thd"
+        torch.testing.assert_close(
+            packed_seq_params.cu_seqlens_q, torch.tensor([0, 12], dtype=torch.int32, device=device)
+        )
+        torch.testing.assert_close(
+            packed_seq_params.cu_seqlens_q_padded,
+            torch.tensor([0, 16], dtype=torch.int32, device=device),
+        )
+        assert padding_mask.shape == (1, 8)
     finally:
         Utils.destroy_model_parallel()
         unset_global_variables()
