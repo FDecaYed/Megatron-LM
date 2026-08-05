@@ -1492,6 +1492,14 @@ def validate_args(args, defaults={}):
     # Packed-sequence buffer-size check. Placed after varlen scheduler
     # auto-select so it validates the final resolved scheduler.
     if args.sequence_packing_scheduler is not None:
+        assert not args.hybrid_context_parallel, (
+            "--sequence-packing-scheduler and --hybrid-context-parallel are "
+            "separate scheduling paths and cannot be enabled together"
+        )
+        assert args.calculate_per_token_loss, (
+            "Sequence packing requires --calculate-per-token-loss so gradients "
+            "do not depend on packing boundaries"
+        )
         args.variable_seq_lengths = True
         assert args.max_seqlen_per_dp_cp_rank is not None, (
             "--max-seqlen-per-dp-cp-rank must be set when using sequence packing"
