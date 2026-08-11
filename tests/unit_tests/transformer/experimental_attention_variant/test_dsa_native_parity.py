@@ -1902,10 +1902,19 @@ def test_cudnn_attention_backward_sanitizes_ignored_topk_slots(monkeypatch, sour
             seen["bwd_q_shape"] = q.shape
             seen["bwd_topk"] = topk_indices.detach().clone()
             seen["bwd_topk_length"] = topk_length.detach().clone()
-            return {"dq": torch.ones_like(q), "dkv": torch.zeros_like(kv)}
+            return {
+                "dq": torch.ones_like(q),
+                "dkv": torch.zeros_like(kv),
+                "d_sink": torch.zeros_like(attn_sink),
+            }
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels,
+        "supports_fused_absorbed_sparse_attention",
+        lambda *_args, **_kwargs: True,
+    )
 
     def fake_indexer_topk(*args, **kwargs):
         return (
@@ -1976,11 +1985,15 @@ def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen
         def sparse_attention_backward_wrapper(
             q, kv, out, dO, lse, attn_sink, topk_indices, softmax_scale, topk_length
         ):
-            del out, dO, lse, attn_sink, softmax_scale
+            del out, dO, lse, softmax_scale
             seen["bwd_q_shape"] = q.shape
             seen["bwd_topk"] = topk_indices.detach().clone()
             seen["bwd_topk_length"] = topk_length.detach().clone()
-            return {"dq": torch.ones_like(q), "dkv": torch.zeros_like(kv)}
+            return {
+                "dq": torch.ones_like(q),
+                "dkv": torch.zeros_like(kv),
+                "d_sink": torch.zeros_like(attn_sink),
+            }
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
@@ -2043,6 +2056,11 @@ def test_cudnn_sparse_attention_uses_supplied_topk_length(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_prepare_attention_topk_indices", fail_prepare)
     monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_flash_mla", fake_flash_mla)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels,
+        "supports_fused_absorbed_sparse_attention",
+        lambda *_args, **_kwargs: True,
+    )
 
     value_dim = 512
     topk_indices = torch.tensor([[[2, 1, -1], [-1, -1, -1]]], dtype=torch.int32)
@@ -2168,13 +2186,17 @@ def test_cudnn_attention_backward_pads_small_local_head_count(monkeypatch):
                 attn_sink.shape,
                 indices.shape,
             )
-            return {"dq": torch.zeros_like(q), "dkv": torch.zeros_like(kv)}
+            return {
+                "dq": torch.zeros_like(q),
+                "dkv": torch.zeros_like(kv),
+                "d_sink": torch.zeros_like(attn_sink),
+            }
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
 
     sq, batch_size, num_heads, attn_dim, value_dim, skv = 2, 1, 8, 4, 3, 4
-    grad_query, grad_kv = dsa_cudnn_kernels._run_sparse_attention_backward(
+    grad_query, grad_kv, grad_sink = dsa_cudnn_kernels._run_sparse_attention_backward(
         q_flat=torch.zeros((sq * batch_size, num_heads, attn_dim), device="cuda"),
         kv_flat=torch.zeros((skv * batch_size, attn_dim), device="cuda"),
         attn_sink=torch.zeros(num_heads, device="cuda"),
@@ -2202,6 +2224,7 @@ def test_cudnn_attention_backward_pads_small_local_head_count(monkeypatch):
     )
     assert grad_query.shape == (sq, batch_size, num_heads, attn_dim)
     assert grad_kv.shape == (skv, batch_size, attn_dim)
+    assert grad_sink.shape == (num_heads,)
 
 
 def test_cudnn_indexer_backward_head_padding_slices_to_actual_heads():

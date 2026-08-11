@@ -208,15 +208,40 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    attn_sink: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    if attn_sink is None:
+        # Preserve the positional hook contract used by existing backends.
+        result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    else:
+        result = fn(
+            query, key, topk_indices, softmax_scale, v_channels, topk_length, attn_sink=attn_sink
+        )
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
     return result
+
+
+def supports_fused_absorbed_sparse_attention(
+    config: TransformerConfig,
+    query: Tensor,
+    key: Tensor,
+    topk_indices: Tensor,
+    v_channels: int,
+    topk_length: Optional[Tensor] = None,
+    attn_sink: Optional[Tensor] = None,
+) -> bool:
+    """Return whether the selected backend accepts this sparse-attention layout."""
+    fn = _resolve_fused_hook(config, "supports_fused_absorbed_sparse_attention")
+    if fn is None:
+        return False
+    return bool(
+        fn(query, key, topk_indices, v_channels, topk_length=topk_length, attn_sink=attn_sink)
+    )
 
 
 def run_fused_dsa_attention(
@@ -296,5 +321,6 @@ __all__ = [
     "run_fused_dsa_attention",
     "run_fused_qk_topk",
     "run_fused_qk_topk_with_loss",
+    "supports_fused_absorbed_sparse_attention",
     "use_fused_dsa_kernels",
 ]

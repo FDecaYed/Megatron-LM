@@ -323,6 +323,15 @@ def no_rope_freq_type(x):
         # it's a single int but in str
         return int(x)
 
+
+def compress_ratios_type(x):
+    """Parse per-layer compression ratios for compressed sparse attention."""
+    if isinstance(x, list):
+        return x
+    assert isinstance(x, str)
+    return _eval_pattern(x)
+
+
 def moe_freq_type(x):
     """Frequency between MoE layers and Dense layers.
 
@@ -881,10 +890,9 @@ def validate_args(args, defaults={}):
                 args.rank
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and (
-            Symbols.MLA in args.hybrid_layer_pattern
-            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    # All MLA-based hybrid attention symbols use MLA projections.
+    if args.hybrid_layer_pattern and any(
+        symbol in args.hybrid_layer_pattern for symbol in Symbols.MLA_ATTENTION
     ):
         args.multi_latent_attention = True
 
@@ -2206,6 +2214,7 @@ def _add_network_size_args(parser):
         "embedding_init_method",
         "activation_func",
         "experimental_attention_variant_loss_scale_func",
+        "dsa_indexer_layer_count",
         # types affect docstring
         "pipeline_model_parallel_layout",
         "window_size",
@@ -2213,6 +2222,8 @@ def _add_network_size_args(parser):
         "no_rope_freq",
         "moe_layer_freq",
         "linear_attention_freq",
+        "csa_compress_ratios",
+        "dsa_kernel_backend",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
@@ -2268,6 +2279,7 @@ def _add_network_size_args(parser):
         "barrier_with_L1_time",
         # args uses same var with a different name
         "num_moe_experts",
+        "actual_vocab_size",
         "fp8_param",
         "fp4_param",
         # incompatible defaults in dataclass
@@ -3399,6 +3411,11 @@ def _add_mla_args(parser):
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--o-groups', type=int, default=8,
+                       help="Number of groups for grouped low-rank output projection (wo_a).")
+    group.add_argument('--o-lora-rank', type=int, default=1024,
+                       help="Low-rank dimension per group for grouped output (wo_a). "
+                            "Used when o-groups > 0.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
     group.add_argument(
@@ -3423,6 +3440,26 @@ def _add_experimental_attention_variant_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument(
+        '--csa-compress-ratios',
+        type=compress_ratios_type,
+        default=None,
+        help='Per-layer compress ratios for compressed sparse attention. '
+             'Accepts a Python list expression such as "[0,0,4,128,4,128]" or '
+             '"([0]+[4,128]*2)*3". Valid values are 0, 4, and 128, and the '
+             'list length must be at least num_layers plus mtp_num_layers.',
+    )
+    # Defined manually so an omitted flag is distinguishable from an explicit
+    # ``none``. The config bridge resolves omission to ``cudnn`` for DSv4
+    # hybrid launches and to ``none`` for ordinary DSA.
+    group.add_argument(
+        '--dsa-kernel-backend',
+        type=str,
+        choices=['none', 'tilelang', 'cudnn'],
+        default=None,
+        help='Fused DSA kernel backend. When omitted, DSv4 hybrid uses cudnn '
+             'and other attention variants use none.',
+    )
     return parser
 
 def _add_heterogeneous_args(parser):

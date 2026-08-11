@@ -4,9 +4,12 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_inference_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -17,11 +20,52 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+
+def _minimal_hybrid_config():
+    return TransformerConfig(
+        num_layers=1, hidden_size=16, num_attention_heads=1, use_cpu_initialization=True
+    )
+
+
+@pytest.mark.parametrize(
+    "stack_spec", [hybrid_stack_spec, hybrid_inference_stack_spec], ids=["default", "inference"]
+)
+@pytest.mark.parametrize(
+    "layer_symbol, slot_name",
+    [(Symbols.CSA, "csa_layer"), (Symbols.HCA, "hca_layer"), (Symbols.WINDOW, "window_layer")],
+)
+def test_dsv4_symbols_reject_identity_slots_from_static_factories(
+    stack_spec, layer_symbol, slot_name
+):
+    assert getattr(stack_spec.submodules, slot_name) is IdentityOp
+
+    with pytest.raises(ValueError, match=rf"{slot_name}.*IdentityOp"):
+        HybridStack(
+            config=_minimal_hybrid_config(),
+            submodules=stack_spec.submodules,
+            layer_type_list=[layer_symbol],
+            pg_collection=object(),
+        )
+
+
+def test_dsv4_symbol_rejects_identity_module_spec():
+    submodules = HybridStackSubmodules(csa_layer=ModuleSpec(module=IdentityOp))
+
+    with pytest.raises(ValueError, match=r"csa_layer.*IdentityOp"):
+        HybridStack(
+            config=_minimal_hybrid_config(),
+            submodules=submodules,
+            layer_type_list=[Symbols.CSA],
+            pg_collection=object(),
+        )
 
 
 @pytest.mark.internal

@@ -24,6 +24,7 @@ from megatron.core.transformer.enums import (
     CudaGraphModule,
     CudaGraphScope,
     InferenceCudaGraphScope,
+    LayerType,
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -227,7 +228,7 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu."""
+    is quick_gelu or SwiGLU (MoE only)."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -291,8 +292,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
+        None
+    )
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -308,6 +311,13 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
+
+    dsa_indexer_layer_count: int = 0
+    """Number of ordinary DSA layers in the resolved HybridModel pattern.
+
+    This internal, pattern-derived value lets mixed DSv4 HybridModel configs validate
+    indexer settings even when ratio-4 CSA runs in dense-oracle mode.
+    """
 
     dsa_indexer_topk_freq: int = 1
     """Frequency of DSA indexer top-k computation across layers.
@@ -342,6 +352,22 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    ####################
+    # Compressed sparse attention
+    ####################
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
 
     ####################
     # linear attention
@@ -546,7 +572,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+             "shared_experts", "gdn_norm_out", "mhc".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -556,7 +582,11 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
+    "mhc": recompute HyperConnection intermediate activations via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
+            enable_hyper_connections=True. Cannot be used with "mlp".
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", and "mhc" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -819,6 +849,15 @@ class TransformerConfig(ModelParallelConfig):
     If positive, generates new random bias each forward pass.
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
+
+    moe_n_hash_layers: int = 0
+    """Number of leading transformer layers that use hash-based MoE routing.
+    Layers with ``layer_number <= moe_n_hash_layers`` select experts from a
+    token-to-expert lookup table instead of learned top-k routing."""
+
+    actual_vocab_size: Optional[int] = None
+    """Vocabulary size of the token-to-expert lookup table.
+    Required when ``moe_n_hash_layers > 0``."""
 
     use_grouped_gemm_for_dense_mlp: bool = False
     """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
@@ -1092,6 +1131,42 @@ class TransformerConfig(ModelParallelConfig):
     migrated to cuda_graph_modules in __post_init__. Will be removed in a future release.
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
+
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    use_fused_mhc: bool = False
+    """Use fused kernels for mHC operations when supported.
+
+    Backend selection is operation-specific, with native torch fallbacks that
+    preserve the same public behavior when Triton or cuTile is unavailable.
+    """
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointWithoutOutputManager is created for subsequent layers
+
+    If None, all layers in the transformer block share a single recompute block.
+
+    Must be a positive integer when set."""
 
     ####################
     # miscellaneous
@@ -1396,6 +1471,95 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+        elif self.experimental_attention_variant == "dsv4_hybrid":
+            assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
+            assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
+            mtp_layers = self.mtp_num_layers or 0
+            expected_len = self.num_layers + mtp_layers
+            assert len(self.csa_compress_ratios) >= expected_len, (
+                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must be at least "
+                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
+            )
+            assert all(
+                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
+            ), "csa_compress_ratios must be 0, 4, or 128"
+            assert (
+                self.tensor_model_parallel_size == 1
+            ), "DSv4 Hybrid Attention only supports TP size 1."
+            assert (
+                self.context_parallel_size == 1
+            ), "DSv4 Hybrid Attention does not support context parallelism yet."
+            assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
+            if self.dsa_kernel_backend == "tilelang":
+                raise ValueError(
+                    "dsv4_hybrid does not support dsa_kernel_backend='tilelang'; use 'cudnn' "
+                    "for fused CSA kernels or 'none' for the PyTorch fallback."
+                )
+            if self.csa_window_size is None or self.csa_window_size <= 0:
+                raise ValueError(f"csa_window_size must be positive, got {self.csa_window_size}.")
+            if not self.bf16 or self.params_dtype != torch.bfloat16:
+                raise ValueError(
+                    "The native DSv4 attention path requires BF16 model execution, got "
+                    f"bf16={self.bf16} and params_dtype={self.params_dtype}."
+                )
+            if self.add_bias_linear or self.add_qkv_bias:
+                raise ValueError("DSv4 Hybrid Attention does not support linear biases.")
+            if self.attention_dropout != 0.0:
+                raise ValueError(
+                    "The native DSv4 attention path does not implement attention dropout; "
+                    f"expected 0.0, got {self.attention_dropout}."
+                )
+            rotary_percent = getattr(self, "rotary_percent", None)
+            if rotary_percent != 1.0:
+                raise ValueError(
+                    "DSv4 Hybrid Attention requires full RoPE (rotary_percent=1.0), got "
+                    f"{rotary_percent}."
+                )
+            if self.qk_l2_norm:
+                raise ValueError("qk_l2_norm is not supported with DSv4 Hybrid Attention.")
+
+            uses_indexer = (
+                4 in self.csa_compress_ratios and not self.csa_dense_mode
+            ) or self.dsa_indexer_layer_count > 0
+            if uses_indexer:
+                if self.dsa_indexer_topk_freq is None or self.dsa_indexer_topk_freq < 1:
+                    raise ValueError(
+                        "dsa_indexer_topk_freq must be positive, got "
+                        f"{self.dsa_indexer_topk_freq}."
+                    )
+                if (
+                    self.dsa_indexer_skip_topk_offset is None
+                    or self.dsa_indexer_skip_topk_offset < 0
+                ):
+                    raise ValueError(
+                        "dsa_indexer_skip_topk_offset must be non-negative, got "
+                        f"{self.dsa_indexer_skip_topk_offset}."
+                    )
+                required_indexer_fields = {
+                    "dsa_indexer_n_heads": self.dsa_indexer_n_heads,
+                    "dsa_indexer_head_dim": self.dsa_indexer_head_dim,
+                    "dsa_indexer_topk": self.dsa_indexer_topk,
+                }
+                for field_name, field_value in required_indexer_fields.items():
+                    if field_value is None or field_value <= 0:
+                        raise ValueError(
+                            f"{field_name} must be positive for indexed DSv4/DSA attention, "
+                            f"got {field_value}."
+                        )
+                pos_emb_head_dim = getattr(self, "qk_pos_emb_head_dim", None)
+                if pos_emb_head_dim is None:
+                    raise ValueError("DSv4 Hybrid Attention requires an MLA qk_pos_emb_head_dim.")
+                if (
+                    self.dsa_indexer_head_dim is not None
+                    and self.dsa_indexer_head_dim < pos_emb_head_dim
+                ):
+                    raise ValueError(
+                        "dsa_indexer_head_dim must be at least qk_pos_emb_head_dim for "
+                        f"indexed DSv4/DSA attention, got {self.dsa_indexer_head_dim} and "
+                        f"{pos_emb_head_dim}."
+                    )
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            self.hetereogenous_dist_checkpoint = True
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1800,6 +1964,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "mhc",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1870,6 +2035,46 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for "mhc" in recompute_modules
+        if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "'mhc' in recompute_modules requires enable_hyper_connections=True."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "'mhc' and 'mlp' in recompute_modules cannot be used together. "
+                    "They use different checkpoint mechanisms that may conflict."
+                )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "'mhc' is in recompute_modules."
+                )
+            if self.fine_grained_activation_offloading:
+                raise NotImplementedError(
+                    "'mhc' in recompute_modules + fine_grained_activation_offloading is "
+                    "not yet supported. The mHC recompute hook currently fires before "
+                    "the offloading backward chunk is initialized, causing tensor_pop "
+                    "on a None chunk. Disable one of them."
+                )
+
+        if self.enable_hyper_connections and not (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        ):
+            warnings.warn(
+                "HyperConnections are enabled but 'mhc' is not in "
+                "recompute_modules with selective recompute. Consider adding 'mhc' to "
+                "recompute_modules with selective recompute to reduce activation memory."
+            )
+
+        if self.use_fused_mhc and not self.enable_hyper_connections:
+            raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
 
         if self.fine_grained_activation_offloading:
             assert (
@@ -2188,6 +2393,33 @@ class TransformerConfig(ModelParallelConfig):
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
 
+        if (
+            self.activation_func_clamp_value is not None
+            and self.activation_func == F.silu
+            and self.gated_linear_unit
+        ):
+            if (
+                not math.isfinite(self.activation_func_clamp_value)
+                or self.activation_func_clamp_value <= 0
+            ):
+                raise ValueError(
+                    "activation_func_clamp_value for SwiGLU must be finite and greater than zero."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError(
+                    "activation_func_clamp_value for SwiGLU is only supported with MoE."
+                )
+            if self.glu_linear_offset != 0.0:
+                raise ValueError(
+                    "glu_linear_offset must be zero when activation_func_clamp_value "
+                    "is set for SwiGLU."
+                )
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "use_te_activation_func must be False "
+                    "when activation_func_clamp_value is not None for SwiGLU"
+                )
+
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
                 warnings.warn(
@@ -2315,6 +2547,48 @@ class TransformerConfig(ModelParallelConfig):
                 "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
+            )
+
+        if self.moe_n_hash_layers > 0:
+            assert (
+                self.actual_vocab_size is not None and self.actual_vocab_size > 0
+            ), "actual_vocab_size must be positive when moe_n_hash_layers > 0."
+            assert (
+                self.num_moe_experts is not None
+            ), "num_moe_experts must be set when moe_n_hash_layers > 0."
+            if self.is_hybrid_model and self.pipeline_model_parallel_size > 1:
+                raise ValueError(
+                    "Hybrid hash routing currently requires pipeline_model_parallel_size=1 "
+                    "because token IDs are not transported between pipeline stages."
+                )
+            if self.mlp_chunks_for_training > 1 or self.mlp_chunks_for_prefill > 1:
+                raise ValueError(
+                    "Hash routing does not support mlp_chunks_for_training or "
+                    "mlp_chunks_for_prefill greater than 1 because token IDs are not chunked "
+                    "with the MLP input."
+                )
+            if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
+                assert self.pipeline_model_parallel_layout is not None, (
+                    "pipeline_model_parallel_layout must be set when using hash MoE "
+                    "layers with pipeline parallelism (PP > 1)."
+                )
+                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
+                    "All hash MoE layers must currently share the virtual pipeline stage "
+                    "that owns the embedding. The embedding stage has "
+                    f"{n_decoders_with_embedding} decoder layers, but "
+                    f"moe_n_hash_layers={self.moe_n_hash_layers}."
+                )
+            assert (
+                not self.overlap_moe_expert_parallel_comm
+            ), "overlap_moe_expert_parallel_comm does not support hash MoE layers yet."
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Hash MoE initialized with a placeholder round-robin token-to-expert table. "
+                "Load a trained table from a checkpoint or provide a workload-aware "
+                "initialization before training.",
             )
 
         if self.num_moe_experts and self.fp8:
@@ -2969,10 +3243,12 @@ class MLATransformerConfig(TransformerConfig):
     """Rank of Query tensor's low rank representation."""
 
     kv_lora_rank: int = 512
-    """Rank of Key and Value tensors' low rank representation."""
+    """Rank of Key and Value tensors' low rank representation.
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_head_dim: int = 128
-    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim"""
+    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_pos_emb_head_dim: int = 64
     """Dimension of the position embedding in the QK projection."""
@@ -3010,6 +3286,12 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
+    o_groups: int = 8
+    """Number of groups for grouped low-rank output projection (wo_a)."""
+
+    o_lora_rank: int = 1024
+    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
@@ -3022,11 +3304,40 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
+        if (
+            self.multi_latent_attention
+            and self.apply_rope_fusion
+            and self.rope_type != "yarn"
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
         if self.attention_output_gate:
             raise NotImplementedError("Output gate is not supported for MLA yet.")
+
+        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim.
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            assert (
+                not self.mla_down_proj_fusion
+            ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
+            assert self.q_lora_rank is not None, "DSv4 hybrid mode requires q_lora_rank."
+            assert self.o_groups > 0, "DSv4 hybrid mode requires o_groups to be positive."
+            assert self.o_lora_rank > 0, "DSv4 hybrid mode requires o_lora_rank to be positive."
+            assert (
+                self.num_attention_heads * self.v_head_dim
+            ) % self.o_groups == 0, (
+                "num_attention_heads * v_head_dim must be divisible by o_groups."
+            )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
+                "v_head_dim and qk_pos_emb_head_dim",
+            )
+            derived = self.v_head_dim - self.qk_pos_emb_head_dim
+            assert derived > 0, "v_head_dim must be greater than qk_pos_emb_head_dim."
+            self.qk_head_dim = derived
+            self.kv_lora_rank = derived
 
         if self.cache_mla_latents:
             assert (

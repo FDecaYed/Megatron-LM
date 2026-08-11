@@ -108,7 +108,7 @@ class CudnnDsaInterface(Protocol):
         softmax_scale: float,
         topk_length: Tensor,
     ) -> dict:
-        """Backprop FlashMLA sparse attention to query and compressed KV (``"dq"``/``"dkv"``)."""
+        """Backprop sparse attention (``"dq"``/``"dkv"``/``"d_sink"``)."""
 
     def sparse_attn_score_recompute_wrapper(
         self,
@@ -1952,12 +1952,16 @@ def _run_sparse_attention_forward(
     d_v: int,
     topk_length: Optional[Tensor] = None,
     sanitize_topk_for_backward_in_place: bool = False,
+    attn_sink: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run FlashMLA sparse attention from local DSA top-k indices."""
     sq, b, num_heads, d = query.shape
     skv = kv_full.shape[0]
 
-    attn_sink = torch.full((num_heads,), float("-inf"), dtype=torch.float32, device=query.device)
+    if attn_sink is None:
+        attn_sink = torch.full(
+            (num_heads,), float("-inf"), dtype=torch.float32, device=query.device
+        )
     if topk_length is None:
         topk_indices_attn, topk_length_attn = _prepare_attention_topk_indices(topk_indices, skv)
     else:
@@ -2010,7 +2014,7 @@ def _run_sparse_attention_backward(
     skv: int,
     grad_output: Tensor,
     all_rows_nonempty: bool = False,
-) -> Tuple[Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor]:
     """Run sparse attention backward, skipping rows that have no valid top-k entries."""
     d_v = out_flat.shape[-1]
     dO_flat = grad_output.reshape(sq * b, num_heads, d_v)
@@ -2056,9 +2060,12 @@ def _run_sparse_attention_backward(
         if padded_num_heads != num_heads:
             grad_query_flat = grad_query_flat[:, :num_heads, :].contiguous()
         grad_kv_flat = attn_bwd["dkv"]
+        grad_attn_sink = attn_bwd["d_sink"]
+        if padded_num_heads != num_heads:
+            grad_attn_sink = grad_attn_sink[:num_heads].contiguous()
         grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
         grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
-        return grad_query, grad_kv_full
+        return grad_query, grad_kv_full, grad_attn_sink
 
     valid_row_indices = torch.nonzero(topk_length > 0, as_tuple=False).flatten()
     dummy_row_index = torch.full(
@@ -2091,10 +2098,13 @@ def _run_sparse_attention_backward(
     grad_query_flat = torch.zeros_like(q_flat)
     grad_query_flat.index_copy_(0, valid_row_indices, grad_query_valid)
     grad_kv_flat = attn_bwd["dkv"]
+    grad_attn_sink = attn_bwd["d_sink"]
+    if padded_num_heads != num_heads:
+        grad_attn_sink = grad_attn_sink[:num_heads].contiguous()
 
     grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
     grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
-    return grad_query, grad_kv_full
+    return grad_query, grad_kv_full, grad_attn_sink
 
 
 class FusedIndexerSparseAttnFunc(torch.autograd.Function):
@@ -2309,7 +2319,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         sq, b, num_heads, d = ctx.sq, ctx.b, ctx.num_heads, ctx.d
         skv = ctx.skv
 
-        grad_query, grad_kv_full = _run_sparse_attention_backward(
+        grad_query, grad_kv_full, _grad_attn_sink = _run_sparse_attention_backward(
             q_flat=q_flat,
             kv_flat=kv_flat,
             attn_sink=attn_sink,
@@ -2530,6 +2540,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         ctx,
         query: Tensor,
         kv_full: Tensor,
+        attn_sink: Optional[Tensor],
         topk_indices: Tensor,
         softmax_scale: float,
         d_v: int,
@@ -2538,9 +2549,16 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         """Run fused sparse attention for precomputed top-k metadata."""
         sq, b, num_heads, d = query.shape
         skv = kv_full.shape[0]
+        ctx.has_attn_sink = attn_sink is not None
         out_flat, lse, q_flat, kv_flat, attn_sink, global_idxs, topk_length_flat = (
             _run_sparse_attention_forward(
-                query, kv_full, topk_indices, softmax_scale, d_v, topk_length=topk_length
+                query,
+                kv_full,
+                topk_indices,
+                softmax_scale,
+                d_v,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
             )
         )
 
@@ -2562,7 +2580,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
 
         sq, b, num_heads, d = ctx.sq, ctx.b, ctx.num_heads, ctx.d
         skv = ctx.skv
-        grad_query, grad_kv_full = _run_sparse_attention_backward(
+        grad_query, grad_kv_full, grad_attn_sink = _run_sparse_attention_backward(
             q_flat=q_flat,
             kv_flat=kv_flat,
             attn_sink=attn_sink,
@@ -2579,7 +2597,53 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             grad_output=grad_output,
         )
 
-        return grad_query, grad_kv_full, None, None, None, None
+        if not ctx.has_attn_sink:
+            grad_attn_sink = None
+        return grad_query, grad_kv_full, grad_attn_sink, None, None, None, None
+
+
+def supports_fused_absorbed_sparse_attention(
+    query: Tensor,
+    key: Tensor,
+    topk_indices: Tensor,
+    v_channels: int,
+    topk_length: Optional[Tensor] = None,
+    attn_sink: Optional[Tensor] = None,
+) -> bool:
+    """Return whether cuDNN/FlashMLA accepts the supplied sparse-attention layout."""
+    if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
+        return False
+    if not query.is_cuda or not key.is_cuda or not topk_indices.is_cuda:
+        return False
+    if query.dtype != torch.bfloat16 or key.dtype != torch.bfloat16:
+        return False
+    if query.device != key.device or query.device != topk_indices.device:
+        return False
+    if topk_indices.dtype not in (torch.int32, torch.int64) or topk_indices.size(-1) <= 0:
+        return False
+    if key.size(2) != 1 or v_channels != _FLASH_MLA_REQUIRED_VALUE_DIM:
+        return False
+    if query.size(0) != topk_indices.size(1) or query.size(1) != topk_indices.size(0):
+        return False
+    if key.size(0) <= 0 or key.size(1) != query.size(1) or key.size(3) != query.size(3):
+        return False
+    if not _supports_flash_mla_value_layout(key.size(-1), v_channels):
+        return False
+    if not _flash_mla_supports_head_count(query):
+        return False
+    if topk_length is not None:
+        if topk_length.shape != topk_indices.shape[:2]:
+            return False
+        if topk_length.device != query.device:
+            return False
+        if topk_length.dtype not in (torch.int32, torch.int64):
+            return False
+    if attn_sink is not None:
+        if attn_sink.shape != (query.size(2),):
+            return False
+        if attn_sink.device != query.device or attn_sink.dtype != torch.float32:
+            return False
+    return True
 
 
 def run_fused_absorbed_sparse_attention(
@@ -2589,24 +2653,17 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    attn_sink: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices."""
-    if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
-        return None
-    if key.size(2) != 1 or v_channels <= 0:
-        return None
-    if query.size(0) != topk_indices.size(1) or query.size(1) != topk_indices.size(0):
-        return None
-    if key.size(1) != query.size(1) or key.size(3) != query.size(3):
-        return None
-    if not _supports_flash_mla_value_layout(key.size(-1), v_channels):
-        return None
-    if not _flash_mla_supports_head_count(query):
+    if not supports_fused_absorbed_sparse_attention(
+        query, key, topk_indices, v_channels, topk_length=topk_length, attn_sink=attn_sink
+    ):
         return None
 
     kv_full = key.squeeze(2).contiguous()
     return FusedSparseAttentionFunc.apply(
-        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length
+        query, kv_full, attn_sink, topk_indices, softmax_scale, v_channels, topk_length
     )
 
 
@@ -2695,4 +2752,5 @@ __all__ = [
     "run_fused_dsa_attention",
     "run_fused_qk_topk",
     "run_fused_qk_topk_with_loss",
+    "supports_fused_absorbed_sparse_attention",
 ]

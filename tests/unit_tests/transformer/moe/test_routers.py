@@ -9,13 +9,15 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
+    get_default_pg_collection,
     get_updated_expert_bias,
     router_gating_linear,
     topk_routing_with_score_function,
 )
-from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.moe.router import InferenceTopKRouter, Router, TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -463,6 +465,28 @@ class TestAuxLossFreeTop2Router:
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_ignores_2d_padding_mask(self):
+        self.router = self.router.cuda()
+        routing_map = torch.tensor(
+            [
+                [True, False, False, False, False, False, False, False],
+                [False, True, False, False, False, False, False, False],
+                [False, False, True, False, False, False, False, False],
+                [False, False, False, True, False, False, False, False],
+                [False, False, False, False, True, False, False, False],
+                [False, False, False, False, False, True, False, False],
+            ],
+            device="cuda",
+        )
+        padding_mask = torch.tensor([[False, True, False], [True, False, True]], device="cuda")
+        self.router.local_tokens_per_expert.zero_()
+
+        self.router._apply_expert_bias(routing_map, padding_mask)
+
+        expected = routing_map[~padding_mask.reshape(-1)].sum(dim=0)
+        assert torch.equal(self.router.local_tokens_per_expert, expected)
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
@@ -615,3 +639,217 @@ def test_topk_routing_precomputed_indices_equivalence(score_function, use_pre_so
     )
     expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, alt_indices, True)
     assert torch.equal(map_alt, expected_map)
+
+
+def _hash_routing_config(**overrides):
+    """Create a small TransformerConfig for hash-routing tests."""
+    defaults = dict(
+        num_layers=3,
+        hidden_size=16,
+        num_attention_heads=8,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_router_load_balancing_type="aux_loss",
+        moe_aux_loss_coeff=0.0,
+        moe_router_dtype="fp32",
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        moe_n_hash_layers=2,
+        actual_vocab_size=128,
+    )
+    defaults.update(overrides)
+    return TransformerConfig(**defaults)
+
+
+def _make_hash_router(config, layer_number, *, inference=False, is_mtp_layer=False):
+    router_cls = InferenceTopKRouter if inference else TopKRouter
+    router = router_cls(
+        config=config, pg_collection=get_default_pg_collection(), is_mtp_layer=is_mtp_layer
+    )
+    router.set_layer_number(layer_number)
+    return router
+
+
+class TestHashRouting:
+    """Hash expert selection and generic TransformerLayer integration."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+        _set_random_seed(seed_=42, data_parallel_random_init=False)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+    def test_hash_routing_correctness(self, score_function):
+        config = _hash_routing_config(moe_router_score_function=score_function)
+        router = _make_hash_router(config, layer_number=1).cuda()
+
+        logits = torch.randn(16, config.num_moe_experts, device="cuda")
+        input_ids = torch.randint(0, config.actual_vocab_size, (4, 4), device="cuda")
+        routing_probs, routing_map = router._hash_routing(logits, input_ids)
+
+        if score_function == "softmax":
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        elif score_function == "sigmoid":
+            scores = torch.sigmoid(logits.float()).type_as(logits)
+        else:
+            scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+
+        top_indices = router.tid2eid[input_ids.T.reshape(-1)].long()
+        expected_probs = scores.gather(1, top_indices)
+        if score_function != "softmax":
+            expected_probs = expected_probs / (expected_probs.sum(dim=-1, keepdim=True) + 1e-20)
+
+        expected_map = torch.zeros_like(routing_map).scatter(1, top_indices, True)
+        expected_routing_probs = torch.zeros_like(routing_probs).scatter(
+            1, top_indices, expected_probs
+        )
+        assert torch.equal(routing_map, expected_map)
+        torch.testing.assert_close(routing_probs, expected_routing_probs)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hash_routing_sequence_parallel_tp2_shards_ids_and_padding(self, monkeypatch):
+        config = _hash_routing_config(sequence_parallel=True, tensor_model_parallel_size=2)
+        router = _make_hash_router(config, layer_number=1).cuda()
+        tp_group = router.tp_group
+        seen_size_groups = []
+        seen_rank_groups = []
+
+        def fake_get_world_size(group=None):
+            seen_size_groups.append(group)
+            return 2
+
+        def fake_get_rank(group=None):
+            seen_rank_groups.append(group)
+            return 1
+
+        monkeypatch.setattr(torch.distributed, "get_world_size", fake_get_world_size)
+        monkeypatch.setattr(torch.distributed, "get_rank", fake_get_rank)
+
+        # Rank 1 receives the second sequence half after sequence-parallel scatter.
+        input_ids = torch.arange(16, device="cuda").reshape(2, 8)
+        padding_mask = torch.zeros(8, 2, dtype=torch.bool, device="cuda")
+        padding_mask[5, 0] = True
+        padding_mask[7, 1] = True
+        logits = torch.randn(4, 2, config.num_moe_experts, device="cuda")
+        seen_padding_masks = []
+
+        def capture_z_loss(logits, padding_mask=None):
+            seen_padding_masks.append(padding_mask)
+            return logits
+
+        monkeypatch.setattr(router, "apply_z_loss", capture_z_loss)
+        _, routing_map = router.routing(logits, padding_mask=padding_mask, input_ids=input_ids)
+
+        local_ids = input_ids.chunk(2, dim=1)[1].T.reshape(-1)
+        local_indices = router.tid2eid[local_ids].long()
+        expected_map = torch.zeros_like(routing_map).scatter(1, local_indices, True)
+        assert torch.equal(routing_map, expected_map)
+        assert len(seen_padding_masks) == 1
+        assert torch.equal(seen_padding_masks[0], padding_mask.chunk(2, dim=0)[1].reshape(-1))
+        assert seen_size_groups == [tp_group, tp_group]
+        assert seen_rank_groups == [tp_group, tp_group]
+
+        # GPTModel already sequence-shards its padding mask; accept that local form
+        # without slicing it a second time while still sharding the full input IDs.
+        local_padding_mask = padding_mask.chunk(2, dim=0)[1]
+        seen_padding_masks.clear()
+        seen_size_groups.clear()
+        seen_rank_groups.clear()
+        _, routing_map = router.routing(
+            logits, padding_mask=local_padding_mask, input_ids=input_ids
+        )
+        assert torch.equal(routing_map, expected_map)
+        assert len(seen_padding_masks) == 1
+        assert torch.equal(seen_padding_masks[0], local_padding_mask.reshape(-1))
+        assert seen_size_groups == [tp_group, tp_group]
+        assert seen_rank_groups == [tp_group]
+
+        with pytest.raises(AssertionError, match="pre-shard tokens"):
+            router._hash_routing(
+                logits.reshape(-1, config.num_moe_experts), local_ids.reshape(2, 4)
+            )
+        with pytest.raises(AssertionError, match="router logits have local shape"):
+            router.routing(logits, padding_mask=padding_mask[:6], input_ids=input_ids)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        ("force_option", "force_value"),
+        [("moe_router_force_load_balancing", True), ("moe_router_force_biased", 0.5)],
+    )
+    def test_forced_routing_overrides_hash_table(self, force_option, force_value):
+        config = _hash_routing_config(moe_router_score_function="softmax")
+        router = _make_hash_router(config, layer_number=1).cuda()
+        setattr(router.config, force_option, force_value)
+
+        router.tid2eid.fill_(0)
+        logits = torch.tensor([[0.0, 1.0, 8.0, 9.0]], device="cuda").expand(16, -1)
+        input_ids = torch.zeros((4, 4), dtype=torch.long, device="cuda")
+        _, routing_map = router._hash_routing(logits, input_ids)
+
+        forced_indices = torch.topk(logits, k=router.topk, dim=1).indices
+        expected_map = torch.zeros_like(routing_map).scatter(1, forced_indices, True)
+        assert torch.equal(routing_map, expected_map)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hash_layer_selection(self):
+        config = _hash_routing_config(
+            moe_router_enable_expert_bias=True, moe_router_score_function="sigmoid"
+        )
+        first = _make_hash_router(config, layer_number=1)
+        boundary = _make_hash_router(config, layer_number=2)
+        learned = _make_hash_router(config, layer_number=3)
+        mtp = _make_hash_router(config, layer_number=1, is_mtp_layer=True)
+
+        assert first.is_hash_layer and first.tid2eid is not None
+        assert boundary.is_hash_layer and boundary.tid2eid is not None
+        assert not learned.is_hash_layer and learned.tid2eid is None
+        assert not mtp.is_hash_layer and mtp.tid2eid is None
+        assert "tid2eid" in first.state_dict()
+        assert "tid2eid" not in learned.state_dict()
+        assert first.enable_expert_bias is False
+        assert learned.enable_expert_bias is True
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_inference_router_hash_fallback(self):
+        config = _hash_routing_config(moe_router_score_function="sqrtsoftplus")
+        router = _make_hash_router(config, layer_number=1, inference=True).cuda()
+        hidden_states = torch.randn(4, 4, config.hidden_size, device="cuda")
+        input_ids = torch.randint(0, config.actual_vocab_size, (4, 4), device="cuda")
+
+        routing_probs, routing_map = router(hidden_states, input_ids=input_ids)
+
+        assert router.is_hash_layer
+        assert routing_probs.shape == routing_map.shape == (16, config.num_moe_experts)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("moe_layer_recompute", [False, True])
+    def test_transformer_layer_hash_routing(self, moe_layer_recompute):
+        config = _hash_routing_config(moe_n_hash_layers=1, moe_layer_recompute=moe_layer_recompute)
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=False
+        )
+        layer = TransformerLayer(config, submodules, layer_number=1).cuda()
+        hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
+        input_ids = torch.randint(0, config.actual_vocab_size, (2, 8), device="cuda")
+
+        output, _ = layer(hidden_states=hidden_states, attention_mask=None, input_ids=input_ids)
+
+        assert layer.mlp.router.is_hash_layer
+        assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
+        output.sum().backward()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
