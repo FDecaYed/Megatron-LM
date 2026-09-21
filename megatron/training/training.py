@@ -2240,6 +2240,7 @@ def wrap_model_chunks_with_ddp(
     pg_collection=None,
     bucket_sizes=None,
     disable_bucketing_per_chunk=None,
+    extra_dp_kwargs=None,
 ):
     """Wrap each model chunk in DDP, pre-computing per-chunk param layouts as needed.
 
@@ -2281,6 +2282,9 @@ def wrap_model_chunks_with_ddp(
             ``[ddp_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
             defaults to ``[False] * len(model_chunks)``.
+        extra_dp_kwargs: Optional extra keyword arguments forwarded to the DDP
+            constructor. Only applied when ``DP is DDP``; FSDP variants do not
+            accept them.
 
     Returns:
         List of DDP-wrapped chunks.
@@ -2353,6 +2357,8 @@ def wrap_model_chunks_with_ddp(
             chunk_kwargs["pg_collection"] = pg_collection
         if layout is not None:
             chunk_kwargs["full_param_layout"] = layout
+        if DP is DDP and extra_dp_kwargs:
+            chunk_kwargs.update(extra_dp_kwargs)
         wrapped.append(
             DP(
                 config=config,
@@ -2602,6 +2608,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             ddp_stream = torch.cuda.Stream()
         ddp_stream.wait_stream(torch.cuda.current_stream())
 
+        dp_extra_kwargs = {}
+        if DP is DDP:
+            dp_extra_kwargs['disable_grad_buffers_cpu_backup'] = getattr(
+                args, 'disable_grad_buffers_cpu_backup', False
+            )
+            dp_extra_kwargs['disable_param_buffers_cpu_backup'] = getattr(
+                args, 'disable_param_buffers_cpu_backup', False
+            )
+
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
@@ -2617,6 +2632,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
+                extra_dp_kwargs=dp_extra_kwargs,
             )
         # Ensure initialization-stream work completes before touching params on the default stream.
         torch.cuda.current_stream().wait_stream(ddp_stream)
