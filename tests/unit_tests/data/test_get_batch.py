@@ -1614,8 +1614,9 @@ def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_schedule
     """Check which ranks build a packed-sequence dataset.
 
     Without the sequence-packing scheduler, middle PP stages read the packing metadata from their
-    own data iterator. The scheduler sends that metadata to them instead and rejects a data
-    iterator on any rank other than TP rank 0 of the first or last PP stage.
+    own data iterator. With the scheduler, every PP stage runs the schedule itself, so TP rank 0 of
+    each PP rank builds exactly one packed dataset: on the last virtual stage of the last PP rank
+    and on the first virtual stage everywhere else.
     """
     tp_size, pp_size = 2, 4
     if tp_size * pp_size > torch.cuda.device_count():
@@ -1644,9 +1645,8 @@ def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_schedule
             if sequence_packing_scheduler is None:
                 expected = tp_rank == 0
             else:
-                on_first_stage = pp_rank == 0 and vp_stage == vp_stages[0]
-                on_last_stage = pp_rank == pp_size - 1 and vp_stage == vp_stages[-1]
-                expected = tp_rank == 0 and (on_first_stage or on_last_stage)
+                data_stage = vp_stages[-1] if pp_rank == pp_size - 1 else vp_stages[0]
+                expected = tp_rank == 0 and vp_stage == data_stage
             assert built == expected, f"{tp_rank=} {pp_rank=} {vp_stage=}"
 
     Utils.destroy_model_parallel()
