@@ -619,7 +619,7 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
     """The dataset placement must give every PP stage the iterator the scheduler runs on.
 
     Each stage schedules the global batch itself, so middle stages, including a standalone
-    MTP stage, need a packed iterator too.
+    MTP stage, need a packed iterator too. FLOPs statistics count real tokens, not padding.
     """
     script = importlib.import_module(script_name)
     pp_size = 4
@@ -665,7 +665,7 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
         ]
 
         scheduler = DpBalancedScheduler(32, 1, 1, None if vp_size is None else pp_size)
-        data_iterator, num_microbatches, _, _ = scheduler.run(
+        data_iterator, num_microbatches, real_tokens, real_token_squares = scheduler.run(
             iterators[0] if vp_size is None else iterators,
             len(real_lengths),
             _group(1),
@@ -676,6 +676,8 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
             config,
         )
         scheduled_counts.append(num_microbatches)
+        assert real_tokens == sum(real_lengths)
+        assert real_token_squares == sum(length * length for length in real_lengths)
 
         stage_iterators = [data_iterator] if vp_size is None else data_iterator
         for vp_stage, stage_iterator in enumerate(stage_iterators):
