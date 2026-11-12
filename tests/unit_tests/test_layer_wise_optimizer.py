@@ -261,6 +261,10 @@ def test_layerwise_offload_rejects_padded_param_layout(monkeypatch):
             reuse_grad_buf_for_mxfp8_param_ag=False,
         ),
         full_param_layout=None,
+        buffers=[],
+        expert_parallel_buffers=[],
+        bucket_groups=[],
+        expert_parallel_bucket_groups=[],
         config=SimpleNamespace(cuda_graph_impl="none"),
     )
 
@@ -273,7 +277,9 @@ def test_layerwise_param_sync_subset_excludes_distopt_buckets():
 
     layerwise_param = SimpleNamespace(is_managed_by_layer_wise_optimizer=True)
     distopt_param = SimpleNamespace(is_managed_by_layer_wise_optimizer=False)
-    layerwise_group = SimpleNamespace(buckets=[SimpleNamespace(params_list=[layerwise_param])])
+    layerwise_group = SimpleNamespace(
+        buckets=[SimpleNamespace(params_list=[layerwise_param])], param_sync_via_bucket_group=True
+    )
     distopt_group = SimpleNamespace(buckets=[SimpleNamespace(params_list=[distopt_param])])
     calls = []
     model_chunk = SimpleNamespace(
@@ -281,7 +287,7 @@ def test_layerwise_param_sync_subset_excludes_distopt_buckets():
         expert_parallel_bucket_groups=[],
         _start_bucket_group_param_sync=lambda group, force_sync: calls.append((group, force_sync)),
     )
-    optimizer = SimpleNamespace(model_chunks=[model_chunk])
+    optimizer = SimpleNamespace(param_sync_bucket_groups=[(model_chunk, layerwise_group)])
 
     LayerWiseDistributedOptimizer.start_param_sync_for_bucket_group_subset(
         optimizer, force_sync=True
@@ -829,10 +835,11 @@ class TestLayerWiseOptimizer:
                 assert len(owners) == 1, "A bucket group mixes LayerWise and DistOpt buckets"
                 if owners.pop():
                     # Without overlap the optimizer gathers the LayerWise params after its step.
-                    assert bucket_group.ddp_config.param_sync_via_bucket_group == overlap
+                    assert bucket_group.param_sync_via_bucket_group == overlap
         _assert_trains_like_reference(model, optimizer, steps=3)
 
-    def test_all_reduce_training_replays_bit_exact(self):
+    @pytest.mark.parametrize("overlap", [False, True])
+    def test_all_reduce_training_replays_bit_exact(self, overlap):
         """Gradient all-reduce next to the sibling DistOpt reduce-scatter, rank-consistent owners
         and uneven whole-param gathers replay bit for bit."""
         from tests.unit_tests.determinism.kernels.harness import bytes_equal
@@ -841,7 +848,7 @@ class TestLayerWiseOptimizer:
         for _ in range(2):
             model, optimizer, _ = _create(
                 grad_collective='all-reduce',
-                overlap_param_gather=True,
+                overlap_param_gather=overlap,
                 grad_reduce_in_fp32=True,
                 bucket_size=4096,
             )

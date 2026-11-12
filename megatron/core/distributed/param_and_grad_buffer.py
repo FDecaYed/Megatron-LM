@@ -39,7 +39,13 @@ from ..fp8_utils import (
     post_all_gather_processing,
     requantize_whole_params_from_high_precision,
 )
-from ..optimizer.param_layout import pad_bucket_end, pad_param_start
+from ..optimizer.param_layout import (
+    BufferKey,
+    ParamGatherPlan,
+    PerBufferParamLayout,
+    pad_bucket_end,
+    pad_param_start,
+)
 from ..utils import is_torch_min_version
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
@@ -146,6 +152,7 @@ class _ParamAndGradBucket:
         bucket_id: int,
         param_index_map: Dict[torch.nn.Parameter, tuple],
         params_with_extra_main_grads: List[torch.nn.Parameter],
+        param_gather_plan: Optional[ParamGatherPlan] = None,
     ):
         self.params_list = params
         self.params = set(params)
@@ -165,6 +172,7 @@ class _ParamAndGradBucket:
             global_start, global_end, _ = param_index_map[param]
             self.param_to_index[param] = (global_start - offset, global_end - offset)
         self.params_with_extra_main_grads = params_with_extra_main_grads
+        self.param_gather_plan = param_gather_plan
 
         # Layer-wise optimizer attributes for async param gather.
         self.layerwise_params_list = None
@@ -176,7 +184,9 @@ class _ParamAndGradBucket:
         self.layerwise_gather_quantized = bool(params) and _param_uses_quantized_storage(params[0])
 
     @torch.no_grad()
-    def _stage_layerwise_mxfp8_params(self, local_data_view: torch.Tensor, local_rank: int) -> None:
+    def _stage_layerwise_master_params(
+        self, local_data_view: torch.Tensor, local_rank: int
+    ) -> None:
         """Stage owner-rank LayerWise MXFP8 masters into the BF16 all-gather input.
 
         LayerWise layouts keep each parameter wholly inside one data-parallel shard.
@@ -261,6 +271,54 @@ def _layerwise_gather_sources(
 
 
 @torch.no_grad()
+def gather_layerwise_params(
+    params_list: List[List[torch.nn.Parameter]],
+    group: torch.distributed.ProcessGroup,
+    *,
+    rank: int,
+    quantized: bool,
+    async_op: bool = False,
+    buffer: Optional[torch.Tensor] = None,
+    flat_sizes: Optional[List[int]] = None,
+) -> Tuple[Optional[List[torch.Tensor]], Optional[torch.distributed.Work]]:
+    """Gather whole parameters using either borrowed storage or temporary receive tensors.
+
+    The caller retains its bucket/domain grouping and owns publication. This shares the
+    actual transport implementation without changing collective granularity or scheduling.
+    """
+    first_param = next((params[0] for params in params_list if params), None)
+    if first_param is None:
+        return None, None
+    dtype = torch.bfloat16 if quantized else first_param.dtype
+    if flat_sizes is None:
+        flat_sizes = [sum(p.numel() for p in params) for params in params_list]
+    if not any(flat_sizes):
+        return None, None
+    sources = _layerwise_gather_sources(params_list[rank], quantized)
+    source = (
+        _flatten_dense_tensors(sources).detach()
+        if sources
+        else torch.empty(0, device=first_param.device, dtype=dtype)
+    )
+    if buffer is None:
+        gathered = [
+            source if i == rank else torch.empty(size, device=first_param.device, dtype=dtype)
+            for i, size in enumerate(flat_sizes)
+        ]
+    else:
+        storage = buffer.view(dtype)
+        assert storage.numel() >= sum(flat_sizes)
+        gathered, offset = [], 0
+        for size in flat_sizes:
+            gathered.append(storage[offset : offset + size])
+            offset += size
+        gathered[rank].copy_(source)
+        source = gathered[rank]
+    work = torch.distributed.all_gather(gathered, source, group=group, async_op=async_op)
+    return gathered, work
+
+
+@torch.no_grad()
 def _copy_back_layerwise_gather(
     params_list: List[List[torch.nn.Parameter]],
     gather_list: List[torch.Tensor],
@@ -332,10 +390,30 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
 
+        # Direct bucket-group construction remains supported. Normal DDP construction passes
+        # the already-resolved plan through the parent buffer.
+        for bucket in buckets:
+            if bucket.param_gather_plan is None:
+                mxfp8 = any(
+                    is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in bucket.params_list
+                )
+                legacy_reuse = ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                bucket.param_gather_plan = ParamGatherPlan.resolve(
+                    sharded=ddp_config.use_distributed_optimizer,
+                    layer_wise=bool(bucket.params_list)
+                    and getattr(bucket.params_list[0], "is_managed_by_layer_wise_optimizer", False),
+                    requires_master_gather=mxfp8,
+                    overlap=ddp_config.overlap_param_gather,
+                    prefer_grad_buffer=mxfp8 if legacy_reuse is None else legacy_reuse,
+                )
+        assert (
+            len({b.param_gather_plan.via_bucket_group for b in buckets}) <= 1
+        ), "A bucket group must use one parameter-gather dispatcher."
+
         # LayerWise parameter sync can use this collective group without the distributed
         # optimizer: asynchronously when overlap is enabled, or synchronously when MXFP8 reuses
         # grad_data as its BF16 all-gather transport.
-        if self.ddp_config.param_sync_via_bucket_group:
+        if self.param_sync_via_bucket_group:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
@@ -422,6 +500,11 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+    @property
+    def param_sync_via_bucket_group(self) -> bool:
+        """Whether these actual buckets, rather than their optimizer, publish parameters."""
+        return bool(self.buckets) and self.buckets[0].param_gather_plan.via_bucket_group
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
@@ -465,8 +548,9 @@ class _ParamAndGradBucketGroup:
                 if param.data_ptr() != gathered_param.data_ptr():
                     param.data.copy_(gathered_param)
 
-        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-            for bucket in self.buckets:
+        native_quantized_params = []
+        for bucket in self.buckets:
+            if bucket.param_gather_plan is ParamGatherPlan.MASTER_BUFFER:
                 has_non_quantized_weight = False
                 quantized_params = []
                 param_slices = []
@@ -492,15 +576,12 @@ class _ParamAndGradBucketGroup:
                 # correspond to multiple param buffers. If we zero out the entire grad buffer,
                 # it would clear the data of those param buffers that have not yet completed AG.
                 bucket.param_data.zero_()
-            return
-
-        quantized_params = []
-        for bucket in self.buckets:
+                continue
             for param in bucket.params:
                 if _param_uses_quantized_storage(param):
-                    quantized_params.append(param)
-        if len(quantized_params) > 0:
-            post_all_gather_processing(quantized_params)
+                    native_quantized_params.append(param)
+        if native_quantized_params:
+            post_all_gather_processing(native_quantized_params)
 
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
@@ -552,7 +633,7 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        assert self.ddp_config.param_sync_via_bucket_group
+        assert self.param_sync_via_bucket_group
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -585,57 +666,22 @@ class _ParamAndGradBucketGroup:
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []
             for bucket in self.buckets:
-                # Use param dtype (e.g., bf16), NOT grad dtype (which may be
-                # fp32 when grad_reduce_in_fp32 is enabled). Quantized params travel as
-                # BF16 staged from their FP32 masters.
-                param_dtype = (
-                    torch.bfloat16
-                    if bucket.layerwise_gather_quantized
-                    else bucket.params_list[0].dtype
+                gathered, work = gather_layerwise_params(
+                    bucket.layerwise_params_list,
+                    group,
+                    rank=local_rank,
+                    quantized=bucket.layerwise_gather_quantized,
+                    async_op=async_op,
+                    buffer=bucket.grad_data,
+                    flat_sizes=bucket.layerwise_param_flat_sizes,
                 )
-
-                if max(bucket.layerwise_param_flat_sizes) == 0:
-                    bucket.layerwise_gather_list = None
-                    continue
-
-                local_size = bucket.layerwise_param_flat_sizes[local_rank]
-                total_gather_size = sum(bucket.layerwise_param_flat_sizes)
-
-                # Reuse grad_data as the all_gather receive buffer; it is idle
-                # during forward and grad_dtype.element_size >= param_dtype.
-                reuse_buf = bucket.grad_data.view(param_dtype)
-                assert reuse_buf.numel() >= total_gather_size
-
-                # Partition reuse_buf into contiguous per-rank receive slices.
-                gather_list = []
-                offset = 0
-                for i in range(dp_size):
-                    size = bucket.layerwise_param_flat_sizes[i]
-                    gather_list.append(reuse_buf[offset : offset + size])
-                    offset += size
-                local_slot_view = gather_list[local_rank]
-
-                # Flatten local params and copy into the local rank's slot.
-                # Detach from autograd since start_param_sync may be called
-                # during the forward pass where autograd is active.
-                if local_size > 0:
-                    sources = _layerwise_gather_sources(
-                        bucket.layerwise_params_list[local_rank], bucket.layerwise_gather_quantized
-                    )
-                    local_slot_view.copy_(_flatten_dense_tensors(sources).detach())
-                bucket.layerwise_gather_list = gather_list
-
-                work = torch.distributed.all_gather(
-                    gather_list, local_slot_view, group=group, async_op=async_op
-                )
-                if async_op and work is not None:
+                bucket.layerwise_gather_list = gathered
+                if work is not None:
                     layerwise_work_handles.append(work)
 
             if async_op:
                 self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
             else:
-                # Synchronous: unflatten and copy gathered params immediately.
-                self._post_param_sync()
                 self.param_gather_handle = None
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
@@ -652,8 +698,8 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                        bucket._stage_layerwise_mxfp8_params(
+                    if bucket.param_gather_plan is ParamGatherPlan.MASTER_BUFFER:
+                        bucket._stage_layerwise_master_params(
                             local_data_view, self.intra_distributed_optimizer_instance_rank
                         )
                     dist_all_gather_func(
@@ -669,7 +715,7 @@ class _ParamAndGradBucketGroup:
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
                 self.param_gather_handle = None
-        if force_sync and self.ddp_config.overlap_param_gather:
+        if not async_op:
             self._post_param_sync()
         self.param_gather_pinned_before_master_offload = False
         self.param_gather_dispatched = True
@@ -1037,8 +1083,6 @@ def group_params_for_buffers(
     Returns:
         Dict mapping BufferKey to (params_list, param_indices).
     """
-    from ..optimizer.param_layout import BufferKey
-
     key_to_params = {}
     dtype_to_offsets = {}
     key_to_indices = {}
@@ -1094,8 +1138,6 @@ def _compute_default_per_buffer_param_layout(
     Returns:
         PerBufferParamLayout with the computed mapping.
     """
-    from ..optimizer.param_layout import PerBufferParamLayout
-
     param_index_map = {}
     bucket_indices = []
     per_bucket_numel_unpadded = []
@@ -1166,6 +1208,7 @@ class _ParamAndGradBuffer:
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
         param_layout: Optional['PerBufferParamLayout'] = None,
+        prefer_grad_buffer: Optional[bool] = None,
     ):
 
         if pg_collection is None:
@@ -1193,6 +1236,23 @@ class _ParamAndGradBuffer:
         self.ddp_config = ddp_config
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
+        mxfp8 = any(is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params)
+        if prefer_grad_buffer is None:
+            legacy_reuse = ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            prefer_grad_buffer = mxfp8 if legacy_reuse is None else legacy_reuse
+        self.param_gather_plan = ParamGatherPlan.resolve(
+            sharded=ddp_config.use_distributed_optimizer,
+            layer_wise=bool(self.params)
+            and getattr(self.params[0], "is_managed_by_layer_wise_optimizer", False),
+            requires_master_gather=mxfp8,
+            overlap=ddp_config.overlap_param_gather,
+            prefer_grad_buffer=prefer_grad_buffer,
+        )
+        if self.param_gather_plan.uses_grad_buffer and ddp_config.grad_buffer_offload:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with parameter all-gather "
+                "through shared gradient storage."
+            )
 
         # Check that params are unique.
         unique_params = set()
@@ -1274,9 +1334,7 @@ class _ParamAndGradBuffer:
         self.nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.param_nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.nccl_grad_pool_is_separate: bool = self.nccl_ub and self.ddp_config.grad_buffer_offload
-        uses_shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and any(
-            is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
-        )
+        uses_shared_param_grad_buffer = self.param_gather_plan is ParamGatherPlan.MASTER_BUFFER
         if self.ddp_config.grad_buffer_offload and uses_shared_param_grad_buffer:
             raise ValueError(
                 "Gradient-buffer offload is incompatible with MXFP8 parameters because "
@@ -1446,28 +1504,10 @@ class _ParamAndGradBuffer:
             nvfp4_packed_param_start_index = None
             if self.has_nvfp4_params:
                 nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
-            # This branch remaps the parameter storage into persistent DDP param_data buffer.
-            #
-            # Enter when:
-            # - `reuse_grad_buf_for_mxfp8_param_ag` is off: param AG has a persistent
-            #   param_data buffer instead of sharing storage with grad_data,
-            #   so every parameter must be backed by param_data.
-            # - param is not quantized: BF16/FP16/plain params still need persistent
-            #   param_data even when quantized params use grad_data as temporary AG storage.
-            #
-            # Skip only when both are true: AG reuses grad_data and the param is quantized.
-            # In that case AG writes into grad_data, then _post_param_sync copies the
-            # gathered values back into TE quantized storage.
-            #
-            # Remap cases below:
-            #   non-grouped TE NVFP4 tensor   -> remap packed rowwise bytes
-            #   non-grouped TE quantized      -> remap TE quantized storage
-            #   regular torch.Tensor param    -> replace param.data with param_data view
-            #   TE GroupedTensor + NVFP4      -> remap packed rowwise bytes
-            #   TE GroupedTensor + MXFP8      -> unsupported here; require grad-buffer AG reuse
-            #   TE GroupedTensor + BF16/FP16  -> remap grouped rowwise_data
+            # Quantized MASTER_BUFFER gathers use gradient storage, then publish into
+            # TE-owned storage. Other parameters retain their persistent param_data views.
             if (
-                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                self.param_gather_plan is not ParamGatherPlan.MASTER_BUFFER
                 or not _param_uses_quantized_storage(param)
             ):
                 if self.param_data is not None:
@@ -1539,8 +1579,7 @@ class _ParamAndGradBuffer:
                         # Use grad-buffer AG reuse and copy gathered values back after AG.
                         elif is_grouped_mxfp8tensor(param):
                             raise RuntimeError(
-                                "Single grouped MXFP8 params require "
-                                "reuse_grad_buf_for_mxfp8_param_ag=True."
+                                "Single grouped MXFP8 params require a master-weight gather plan."
                             )
                         elif is_grouped_tensor_with_quantized_storage(param):
                             raise RuntimeError(
@@ -1810,6 +1849,7 @@ class _ParamAndGradBuffer:
             bucket_id=bucket_id,
             param_index_map=self.param_index_map,
             params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+            param_gather_plan=self.param_gather_plan,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
@@ -1928,6 +1968,32 @@ class _ParamAndGradBuffer:
             self.grad_data.storage().resize_(self.grad_data_size)
             self.grad_data.zero_()
             self.grad_data_size = 0
+
+
+def bind_param_sync_bucket_groups(
+    model_chunks: List[torch.nn.Module], buffers: List[_ParamAndGradBuffer]
+) -> List[Tuple[torch.nn.Module, _ParamAndGradBucketGroup]]:
+    """Bind an optimizer to the existing DDP groups containing its buffers.
+
+    Never create new groups here: handles, dispatch state and offload pins belong to DDP's
+    group objects. A group cannot be partly owned by this optimizer and partly by a sibling.
+    """
+    bucket_ids = {id(bucket) for buffer in buffers for bucket in buffer.buckets}
+    result = []
+    covered = set()
+    for model_chunk in model_chunks:
+        for group in model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups:
+            owned = [id(bucket) in bucket_ids for bucket in group.buckets]
+            if not any(owned):
+                continue
+            assert all(owned), "A parameter-sync bucket group has multiple optimizer owners."
+            assert not any(
+                id(bucket) in covered for bucket in group.buckets
+            ), "A buffer bucket occurs in more than one DDP parameter-sync group."
+            covered.update(id(bucket) for bucket in group.buckets)
+            result.append((model_chunk, group))
+    assert covered == bucket_ids, "Optimizer buffers are missing from the DDP bucket groups."
+    return result
 
 
 def partition_buckets(

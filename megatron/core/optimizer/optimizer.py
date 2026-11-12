@@ -509,6 +509,10 @@ class MegatronOptimizer(ABC):
         """
         self.ensure_master_weights_for_param_sync()
 
+    def stage_model_params_after_grad_buffer_reset(self) -> None:
+        """Restore gather inputs invalidated by clearing gradient storage, without a gather."""
+        return
+
     def _stage_model_params_from_main_params(self) -> None:
         """Re-derive this optimizer's model params from its FP32 main params.
 
@@ -543,7 +547,7 @@ class MegatronOptimizer(ABC):
 
         Called by :meth:`ChainedOptimizer.quantize_and_sync_model_params_from_main_params`
         after every member has staged its params. DDP skips the bucket groups of such params
-        (see ``DistributedDataParallelConfig.param_sync_via_bucket_group``).
+        (see ``_ParamAndGradBucketGroup.param_sync_via_bucket_group``).
         """
         return
 
@@ -1209,24 +1213,16 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            # The reuse_grad_buf (fp8-param-gather) path stages master params into the DDP
-            # param buffer, which only DistributedOptimizer owns. Optimizers without it
-            # (e.g. LayerWiseDistributedOptimizer's Float16 base opts) must instead copy
-            # master -> model params so the forward sees the update.
-            if self.config.reuse_grad_buf_for_mxfp8_param_ag and hasattr(
-                self, "_copy_main_params_to_param_buffer"
-            ):
-                # In the case of overlap_param_gather,
-                # copy is manually called in the training loop
-                if not self.config.overlap_param_gather:
-                    self._copy_main_params_to_param_buffer()
-            else:
-                self._copy_main_params_to_model_params()
+            self._copy_main_params_after_optimizer_step()
 
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
         return True
+
+    def _copy_main_params_after_optimizer_step(self) -> None:
+        """Publish an ordinary optimizer's updated weights; DistOpt owns its staging policy."""
+        self._copy_main_params_to_model_params()
 
     @torch.no_grad()
     def step(self):
@@ -1678,7 +1674,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 make_sharded_optimizer_tensor(
                     id_to_sharded_param_map[param_id],
                     fp32_param,
-                    prefix=f'optimizer.state.fp32_param',
+                    prefix='optimizer.state.fp32_param',
                 )
                 for param_id, fp32_param in zip(param_ids, fp32_group, strict=True)
             ]
@@ -2029,6 +2025,13 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def __init__(self, chained_optimizers: List[MegatronOptimizer]):
         self.model_chunks = []
+        group_owners = {}
+        for optimizer in chained_optimizers:
+            for _, group in getattr(optimizer, "param_sync_bucket_groups", []):
+                owner = group_owners.setdefault(id(group), optimizer)
+                assert (
+                    owner is optimizer
+                ), "Chained optimizers cannot own the same DDP bucket group."
         # chained_optimizers would be empty in the case that a rank
         # has no trainable parameters
         if chained_optimizers:
@@ -2380,38 +2383,8 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage params once per DDP model chunk before explicit param sync."""
-        use_reused_grad_buffer = (
-            self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather
-        )
-        if not use_reused_grad_buffer:
-            for optimizer in self.chained_optimizers:
-                optimizer.prepare_model_params_for_param_sync()
-            return
-
-        from .distrib_optimizer import DistributedOptimizer
-
-        model_chunks = []
-        model_chunk_ids = set()
-        dist_optimizers = []
-
         for optimizer in self.chained_optimizers:
-            if isinstance(optimizer, DistributedOptimizer):
-                dist_optimizers.append(optimizer)
-                if getattr(optimizer, 'is_stub_optimizer', False):
-                    continue
-                for model_chunk in optimizer.model_chunks:
-                    model_chunk_id = id(model_chunk)
-                    if model_chunk_id not in model_chunk_ids:
-                        model_chunk_ids.add(model_chunk_id)
-                        model_chunks.append(model_chunk)
-            else:
-                optimizer.prepare_model_params_for_param_sync()
-
-        for model_chunk in model_chunks:
-            model_chunk.zero_grad_buffer()
-        for optimizer in dist_optimizers:
-            if not getattr(optimizer, 'is_stub_optimizer', False):
-                optimizer._copy_main_params_to_param_buffer()
+            optimizer.prepare_model_params_for_param_sync()
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -2438,101 +2411,16 @@ class ChainedOptimizer(MegatronOptimizer):
                     optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
         return success
 
-    def _should_defer_mxfp8_param_sync(self) -> bool:
-        """Return whether MXFP8 param sync should be deferred until chained steps finish.
-
-        The deferred-sync path is only needed when MXFP8 grad/param buffer reuse is active
-        AND the DDP-level param gather is not overlapped (i.e. the race fixed by PR #4800
-        can occur). The OptimizerConfig.overlap_param_gather field is unreliable as a proxy
-        for the DDP-level setting -- the two configs can diverge -- so probe the underlying
-        DistOpts directly.
-        """
-        if not self.config.reuse_grad_buf_for_mxfp8_param_ag:
-            return False
-
-        from .distrib_optimizer import DistributedOptimizer
-
-        for optimizer in self.chained_optimizers:
-            if not isinstance(optimizer, DistributedOptimizer):
-                continue
-            if not optimizer.ddp_config.overlap_param_gather:
-                return True
-        return False
-
-    def _enable_deferred_mxfp8_param_sync(self) -> List[Tuple[Any, Any]]:
-        """Enable deferred DistOpt param sync and collect bucket groups to sync later."""
-        from .distrib_optimizer import DistributedOptimizer
-        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
-
-        # With MXFP8 grad-buffer reuse and non-overlap param gather, each DistOpt stages
-        # its own updated main-param shards into its param buffers during step. However,
-        # param sync is a DDP bucket-group operation that copies gathered values into model
-        # weights and zeros the shared MXFP8 param/grad buffers. For MoE, dense and expert
-        # DistOpts may share the same model chunk, so defer param sync until all chained
-        # optimizers have staged their params, then sync each DistOpt-managed bucket group once.
-        deferred_bucket_groups = []
-        deferred_bucket_group_ids = set()
-
-        for optimizer in self.chained_optimizers:
-            if not isinstance(optimizer, DistributedOptimizer):
-                continue
-
-            optimizer._defer_param_sync = True
-            for model_chunk in optimizer.model_chunks:
-                for bucket_group in (
-                    model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
-                ):
-                    if not bucket_group.buckets:
-                        continue
-                    if _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0]):
-                        continue
-
-                    bucket_group_id = id(bucket_group)
-                    if bucket_group_id in deferred_bucket_group_ids:
-                        continue
-
-                    deferred_bucket_group_ids.add(bucket_group_id)
-                    deferred_bucket_groups.append((model_chunk, bucket_group))
-
-        return deferred_bucket_groups
-
-    def _disable_deferred_mxfp8_param_sync(self) -> None:
-        """Disable deferred DistOpt param sync."""
-        for optimizer in self.chained_optimizers:
-            if hasattr(optimizer, '_defer_param_sync'):
-                optimizer._defer_param_sync = False
-
-    def _start_deferred_mxfp8_param_sync(
-        self, deferred_bucket_groups: List[Tuple[Any, Any]]
-    ) -> None:
-        """Start param sync for deferred bucket groups."""
-        timers = self.config.timers
-        if timers is not None:
-            timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
-        for model_chunk, bucket_group in deferred_bucket_groups:
-            model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
-        if timers is not None:
-            timers('params-all-gather').stop()
-
-    def _step_with_deferred_mxfp8_param_sync(self) -> bool:
-        """Step optimizers with MXFP8 param sync deferred until all steps finish."""
-        deferred_bucket_groups = self._enable_deferred_mxfp8_param_sync()
-        try:
-            success = self._step()
-        finally:
-            self._disable_deferred_mxfp8_param_sync()
-
-        if success and deferred_bucket_groups:
-            self._start_deferred_mxfp8_param_sync(deferred_bucket_groups)
-
-        return success
-
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
-        """Step the optimizer with ready gradients, return successful."""
-        if self._should_defer_mxfp8_param_sync():
-            return self._step_with_deferred_mxfp8_param_sync()
+        # Each member syncs only its bound DDP groups. A sibling can no longer gather or
+        # clear another optimizer's buffers before that optimizer has staged its update.
         return self._step()
+
+    def stage_model_params_after_grad_buffer_reset(self) -> None:
+        """Restore each member's own gather inputs; members without shared storage do nothing."""
+        for optimizer in self.chained_optimizers:
+            optimizer.stage_model_params_after_grad_buffer_reset()
 
     def grads_states_parallel_group_is_shared(self):
         """Check if all optimizers share the same gradient statistics parallel group."""

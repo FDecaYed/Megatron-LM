@@ -330,10 +330,11 @@ class TestMuonDecoupleFP8ParamGather:
         ids, labels, pos, mask, loss_mask = self._batch()
         losses, outs, grads, masters, params = [], [], [], [], []
         for _ in range(n):
-            delay_master_offload = (
-                args.chunked_optimizer_state_offload
-                and args.reuse_grad_buf_for_mxfp8_param_ag
-                and args.overlap_param_gather
+            delay_master_offload = args.chunked_optimizer_state_offload and any(
+                isinstance(child, DistributedOptimizer)
+                and child.requires_param_buffer_staging
+                and child.ddp_config.overlap_param_gather
+                for child in optimizer.chained_optimizers
             )
             pre_forward_sync = (
                 args.chunked_optimizer_state_offload
@@ -355,11 +356,7 @@ class TestMuonDecoupleFP8ParamGather:
             # the DistOpt sibling buffers must re-stage masters before the deferred (overlap) param
             # all-gather (mirrors the training loop). The non-DistOpt LayerWise children stage via
             # _copy_main_params_to_model_params inside step, so they need no manual re-stage here.
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                for opt in optimizer.chained_optimizers:
-                    if isinstance(opt, DistributedOptimizer):
-                        # The staging entry restores its own offloaded masters, matching train_step.
-                        opt._copy_main_params_to_param_buffer()
+            optimizer.stage_model_params_after_grad_buffer_reset()
             if delay_master_offload:
                 optimizer.offload_optimizer_state_for_forward()
             model[0].set_is_first_microbatch()
@@ -453,10 +450,11 @@ class TestMuonDecoupleFP8ParamGather:
 
         losses, masters, params = [], [], []
         for _ in range(n):
-            delay_master_offload = (
-                args.chunked_optimizer_state_offload
-                and args.reuse_grad_buf_for_mxfp8_param_ag
-                and args.overlap_param_gather
+            delay_master_offload = args.chunked_optimizer_state_offload and any(
+                isinstance(child, DistributedOptimizer)
+                and child.requires_param_buffer_staging
+                and child.ddp_config.overlap_param_gather
+                for child in optimizer.chained_optimizers
             )
             pre_forward_sync = (
                 args.chunked_optimizer_state_offload
@@ -475,10 +473,7 @@ class TestMuonDecoupleFP8ParamGather:
                 optimizer.offload_optimizer_state_for_forward(
                     offload_master=not delay_master_offload
                 )
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                for opt in optimizer.chained_optimizers:
-                    if isinstance(opt, DistributedOptimizer):
-                        opt._copy_main_params_to_param_buffer()
+            optimizer.stage_model_params_after_grad_buffer_reset()
             if delay_master_offload:
                 optimizer.offload_optimizer_state_for_forward()
             losses_reduced = forward_backward_func(

@@ -1280,12 +1280,9 @@ def validate_args(args, defaults={}):
             'reused for the MXFP8 parameter all-gather whenever --fp8-param-gather is set.',
             args.rank,
         )
-    args.reuse_grad_buf_for_mxfp8_param_ag = (
-        args.fp8 is not None
-        and args.fp8_recipe == 'mxfp8'
-        and args.fp8_param_gather
-        and not (args.use_megatron_fsdp or args.use_torch_fsdp2)
-    )
+    # Keep the deprecated spelling readable, but do not turn a derived execution choice
+    # back into a user configuration field. Buffer construction resolves the actual plan.
+    args.reuse_grad_buf_for_mxfp8_param_ag = None
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -4082,8 +4079,8 @@ def _add_mixed_precision_args(parser):
     group.add_argument(
         '--reuse-grad-buf-for-mxfp8-param-ag',
         action='store_true',
-        help='Deprecated and ignored: the grad buffer is reused for the MXFP8 '
-        'parameter all-gather whenever --fp8-param-gather is set.',
+        default=None,
+        help=argparse.SUPPRESS,
     )
     group.add_argument(
         '--mamba-training-ssm-states-dtype',

@@ -75,6 +75,17 @@ Both store the same optimizer state, so a `torch_dist` checkpoint saved with one
 
 With `--fp8-param-gather`, both collectives gather quantized parameters as BF16 values staged from the FP32 masters and requantize them on every rank. `reduce-scatter` stages them through the gradient buffer for its fixed-size all-gather and supports only MXFP8; use `all-reduce` for blockwise FP8 parameters.
 
+Parameter-gather storage is selected during buffer construction from the recipe, layout and
+overlap policy. DDP and the optimizer use the same resolved plan; buffer reuse is not another
+user-selected flag. `--reuse-grad-buf-for-mxfp8-param-ag` remains accepted with a deprecation
+warning and is ignored. Old Core configuration dictionaries can still supply the corresponding
+field: `None` selects automatic behavior, while an explicit `False` preserves the compact,
+non-overlapped temporary-buffer path. New serialized configurations omit the unset legacy field.
+
+Automatic MXFP8 staging still cannot be combined with gradient-buffer offload. NVFP4 in the
+standard distributed optimizer retains its existing packed-storage transport and scale handling;
+the layer-wise optimizer does not gain NVFP4 support from this internal gather-plan interface.
+
 ### Migrating from the boolean layout flags
 
 `--second-order-optimizer-grad-collective` replaces the boolean `--use-layer-wise-param-layout` / `--no-use-layer-wise-param-layout` flags:

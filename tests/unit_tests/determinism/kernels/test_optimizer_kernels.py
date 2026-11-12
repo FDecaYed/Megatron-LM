@@ -6,6 +6,8 @@ Adam update. These run once per step on every parameter, so any drift here chang
 whole trajectory even when the model kernels are deterministic.
 """
 
+from types import MethodType, SimpleNamespace
+
 import pytest
 import torch
 
@@ -16,6 +18,8 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
@@ -27,6 +31,59 @@ from tests.unit_tests.determinism.utils import RacingStreams
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+def test_shared_parameter_gather_staging_replays():
+    """Gradient reset followed by chained staging preserves every owner's BF16 payload."""
+    from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
+
+    seeded()
+    masters = tuple(torch.randn(1024, device="cuda", dtype=torch.float32) for _ in range(2))
+    config = SimpleNamespace()
+    optimizers, payloads, storage = [], [], []
+    groups = [
+        SimpleNamespace(param_gather_handle=None, param_gather_dispatched=True) for _ in masters
+    ]
+    chunk = SimpleNamespace(bucket_groups=groups, expert_parallel_bucket_groups=[])
+    chunk.reset_param_sync_dispatch_state = MethodType(
+        DistributedDataParallel.reset_param_sync_dispatch_state, chunk
+    )
+    for master, group in zip(masters, groups):
+        grad = torch.empty_like(master)
+        payload = grad[: master.numel() // 2].view(torch.bfloat16)
+        param = torch.nn.Parameter(torch.zeros_like(master, dtype=torch.bfloat16))
+        optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
+        optimizer.config = config
+        optimizer.is_stub_optimizer = False
+        optimizer.requires_param_buffer_staging = True
+        optimizer.ddp_config = SimpleNamespace(use_megatron_fsdp=False, overlap_param_gather=True)
+        optimizer.model_chunks = [chunk]
+        optimizer.param_sync_bucket_groups = [(chunk, group)]
+        optimizer.buffers = [SimpleNamespace(buckets=[SimpleNamespace(param_data=payload)])]
+        optimizer.model_param_gbuf_map = {param: (0, None, 0)}
+        optimizer._get_model_param_range_map = lambda p: {
+            "gbuf_world_in_bucket": SimpleNamespace(start=0, end=p.numel())
+        }
+        optimizer.model_float16_groups = [[param]]
+        optimizer.shard_fp32_from_float16_groups = [[master]]
+        optimizers.append(optimizer)
+        payloads.append(payload)
+        storage.append(grad)
+    chained = ChainedOptimizer(optimizers)
+
+    def stage(*values):
+        for optimizer, value, grad in zip(optimizers, values, storage):
+            optimizer.shard_fp32_from_float16_groups = [[value]]
+            grad.zero_()
+        chained.stage_model_params_after_grad_buffer_reset()
+        return tuple(payloads)
+
+    actual = stage(*masters)
+    for got, master in zip(actual, masters):
+        assert bytes_equal(got, master.to(torch.bfloat16))
+    assert_replays_bit_exact(
+        stage, masters, backward=False, contention=True, what="shared parameter gather staging"
+    )
 
 
 def _grads(num=256, seed=7):

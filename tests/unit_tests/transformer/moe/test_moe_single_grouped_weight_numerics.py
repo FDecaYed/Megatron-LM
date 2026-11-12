@@ -401,8 +401,7 @@ class TestMoESingleGroupedWeightNumerics:
     def run_one_mxfp8_overlap_train_step(self, args, model, optimizer, batch):
         model[0].zero_grad_buffer()
         optimizer.zero_grad()
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-            optimizer.prepare_model_params_for_param_sync()
+        optimizer.prepare_model_params_for_param_sync()
         model[0].set_is_first_microbatch()
         output = model[0].forward(
             input_ids=batch[0],
@@ -423,8 +422,7 @@ class TestMoESingleGroupedWeightNumerics:
         return loss.detach().float().cpu()
 
     def run_mxfp8_eval_step(self, args, model, optimizer, batch):
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-            optimizer.prepare_model_params_for_param_sync()
+        optimizer.prepare_model_params_for_param_sync()
 
         model[0].disable_forward_pre_hook(param_sync=True)
         model[0].eval()

@@ -4835,11 +4835,11 @@ def train_step(
         chunked_optimizer_state_offload
         and optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
     )
-    # The MXFP8 param-buffer staging of a DistributedOptimizer reads its masters after the grad
-    # buffers are zeroed; follow each optimizer's own DDP config, like that staging does.
+    # Shared-buffer staging reads masters after gradient reset; keep them resident until
+    # each owning optimizer has restored its gather inputs.
     delay_master_offload_for_param_buffer = chunked_optimizer_state_offload and any(
         isinstance(optim_instance, DistributedOptimizer)
-        and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+        and optim_instance.requires_param_buffer_staging
         and optim_instance.ddp_config.overlap_param_gather
         for optim_instance in getattr(optimizer, 'chained_optimizers', [optimizer])
     )
@@ -4950,40 +4950,12 @@ def train_step(
         else:
             adjust_tensor_shapes_fn = None
 
-        # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-        # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
-        # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
-        #
-        # However, we should skip this on the first iteration when forward_pre_hook is disabled,
-        # because:
-        # 1. The first iteration's params are already in param.data (from init or checkpoint).
-        # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
-        #    so the main grads will be polluted by the main params.
-        #
-        # Exception: when a full-iteration CUDA graph has been captured, the all-gather
-        # and subsequent param_data zero are baked into the graph and replay
-        # unconditionally. We must populate param_data so the replayed AG gathers
-        # correct weights, even when forward pre-hooks are disabled.
-        # A model component's DDP config may differ from the global args. Check the
-        # DistributedOptimizer config that owns the buffers and hooks; non-overlapped
-        # optimizers stage during optimizer.step().
-        optimizer_instances = getattr(optimizer, 'chained_optimizers', [optimizer])
-        mxfp8_overlap_optimizers = [
-            optim_instance
-            for optim_instance in optimizer_instances
-            if (
-                isinstance(optim_instance, DistributedOptimizer)
-                and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                and optim_instance.ddp_config.overlap_param_gather
-            )
-        ]
-        if mxfp8_overlap_optimizers:
-            # Check if forward_pre_hook is enabled by checking if hooks are registered.
-            forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
-            full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
-            if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in mxfp8_overlap_optimizers:
-                    optim_instance._copy_main_params_to_param_buffer()
+        # Shared gather inputs were invalidated by zero_grad_buffer. Ordinary first-iteration
+        # execution has no gather hook; a captured full-iteration graph still replays its gather.
+        forward_pre_hook_enabled = bool(getattr(model[0], "remove_forward_pre_hook_handles", []))
+        full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
+        if forward_pre_hook_enabled or full_cg_captured:
+            optimizer.stage_model_params_after_grad_buffer_reset()
 
         if getattr(config, 'sequence_packing_scheduler', None) is not None:
             # Dynamic-CP / sequence packing must happen after the rerun state machine has
@@ -6653,11 +6625,11 @@ def train(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = (
-            cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
-        )
         forward_backward_func = PagedStashRunner(
-            config, copy_main_params, model, optimizer, forward_backward_func
+            config,
+            model,
+            optimizer,
+            forward_backward_func,
         )
     if cfg.optimizer.optimizer_cuda_graph:
         optimizer.step = OptimizerCudaGraphWrapper(
@@ -7469,11 +7441,11 @@ def evaluate(
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = (
-            cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
-        )
         forward_backward_func = PagedStashRunner(
-            config, copy_main_params, model, None, forward_backward_func
+            config,
+            model,
+            None,
+            forward_backward_func,
         )
 
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):

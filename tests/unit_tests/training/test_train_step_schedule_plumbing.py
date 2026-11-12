@@ -2,15 +2,16 @@
 
 """Training-loop plumbing regression tests."""
 
-import inspect
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
 from megatron.core.enums import ModelType
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.training import training as training_mod
 from megatron.training.state import TrainState
 
@@ -162,6 +163,7 @@ def test_train_step_drives_chunked_optimizer_state_offload_lifecycle():
     # The delayed master offload follows the DistributedOptimizer whose MXFP8 parameter
     # buffer reuses the gradient buffer with an overlapped gather.
     distopt_child = DistributedOptimizer.__new__(DistributedOptimizer)
+    distopt_child.requires_param_buffer_staging = True
     distopt_child.ddp_config = SimpleNamespace(
         reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
     )
@@ -299,6 +301,7 @@ def test_mxfp8_staging_delegates_master_restore_to_distributed_optimizer():
     events = []
 
     class FakeDistributedOptimizer:
+        requires_param_buffer_staging = True
         ddp_config = SimpleNamespace(
             reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
         )
@@ -326,6 +329,9 @@ def test_mxfp8_staging_delegates_master_restore_to_distributed_optimizer():
 
         def ensure_master_weights_for_param_sync(self):
             raise AssertionError("must not restore the whole optimizer chain")
+
+        def stage_model_params_after_grad_buffer_reset(self):
+            self.chained_optimizers[1]._copy_main_params_to_param_buffer()
 
         def zero_grad(self):
             events.append("zero_grad")
@@ -661,66 +667,54 @@ def test_dynamic_cp_cuda_graph_upper_bound_uses_dp_cp_and_sp_padding():
     assert training_mod._get_thd_sequence_length_upper_bound(args) == 1024
 
 
-def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():
-    class _DistributedOptimizer:
-        def __init__(self, overlap_param_gather):
-            self.ddp_config = SimpleNamespace(
-                reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=overlap_param_gather
-            )
-            self._copy_main_params_to_param_buffer = mock.Mock()
+@pytest.mark.parametrize(
+    "chained, overlap, hooks, captured",
+    [
+        (False, True, True, False),
+        (True, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+        (True, True, False, True),
+    ],
+)
+def test_train_step_restores_shared_gather_input_after_gradient_reset(
+    monkeypatch, chained, overlap, hooks, captured
+):
+    storage = torch.full((2,), -1.0)
+    master = torch.tensor([3.0, 7.0])
 
-    overlapped = _DistributedOptimizer(overlap_param_gather=True)
-    nonoverlapped = _DistributedOptimizer(overlap_param_gather=False)
-    optimizer = SimpleNamespace(
-        zero_grad=lambda: None, chained_optimizers=[overlapped, nonoverlapped]
-    )
-    model = [
-        SimpleNamespace(
-            force_all_reduce=False,
-            zero_grad_buffer=lambda: None,
-            remove_forward_pre_hook_handles={object(): object()},
-        )
-    ]
-
-    with mock.patch.object(training_mod, "DistributedOptimizer", _DistributedOptimizer):
-        # Global args intentionally disagree; the optimizer DDP config is authoritative.
-        _run(
-            args_overrides={
-                "reuse_grad_buf_for_mxfp8_param_ag": False,
-                "overlap_param_gather": False,
-            },
-            model=model,
-            optimizer=optimizer,
+    class Optimizer:
+        stage_model_params_after_grad_buffer_reset = (
+            DistributedOptimizer.stage_model_params_after_grad_buffer_reset
         )
 
-    overlapped._copy_main_params_to_param_buffer.assert_called_once_with()
-    nonoverlapped._copy_main_params_to_param_buffer.assert_not_called()
-
-
-def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
-    class _DistributedOptimizer:
         def __init__(self):
-            self.ddp_config = SimpleNamespace(
-                reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
-            )
-            self._copy_main_params_to_param_buffer = mock.Mock()
+            self.is_stub_optimizer = False
+            self.requires_param_buffer_staging = True
+            self.ddp_config = SimpleNamespace(use_megatron_fsdp=False, overlap_param_gather=overlap)
 
-        def zero_grad(self):
+        def zero_grad(self, *args, **kwargs):
             pass
 
-    optimizer = _DistributedOptimizer()
+        def _copy_main_params_to_param_buffer(self):
+            storage.copy_(master)
+
+    optimizer = Optimizer()
+    if chained:
+        optimizer = ChainedOptimizer([optimizer])
     model = [
         SimpleNamespace(
             force_all_reduce=False,
-            zero_grad_buffer=lambda: None,
-            remove_forward_pre_hook_handles={object(): object()},
+            zero_grad_buffer=lambda: storage.zero_(),
+            remove_forward_pre_hook_handles={object(): object()} if hooks else {},
         )
     ]
-
-    with mock.patch.object(training_mod, "DistributedOptimizer", _DistributedOptimizer):
-        _run(model=model, optimizer=optimizer)
-
-    optimizer._copy_main_params_to_param_buffer.assert_called_once_with()
+    monkeypatch.setattr(
+        training_mod.FullCudaGraphWrapper, "cuda_graph", {"training": object()} if captured else {}
+    )
+    _run(model=model, optimizer=optimizer)
+    expected = master if overlap and (hooks or captured) else torch.zeros_like(master)
+    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
 
 
 def test_model_process_groups_fall_back_when_attribute_is_missing_or_none():

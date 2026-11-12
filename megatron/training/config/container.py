@@ -21,6 +21,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer.param_layout import prefer_grad_buffer_for_param_gather
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.dataset_config import DataConfig
@@ -227,6 +228,8 @@ class ConfigContainerBase:
                     continue
 
                 field_value = getattr(value, field.name)
+                if field_value is None and field.metadata.get("omit_if_none"):
+                    continue
                 result[field.name] = cls._convert_value_to_dict(field_value)
 
             return result
@@ -395,6 +398,7 @@ class PretrainConfigContainer(ConfigContainerBase):
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
         self.rl.validate_ddp_config(self.ddp)
+        self._validate_ddp_config()
         super().validate()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
@@ -418,6 +422,28 @@ class PretrainConfigContainer(ConfigContainerBase):
             weight_decay=self.optimizer.weight_decay,
         )
         self._validate_data_section()
+
+    def _validate_ddp_config(self) -> None:
+        """Validate resolved gather storage before finalization or buffer allocation."""
+        transformer = getattr(self.model, "transformer", None)
+        prefer_grad_buffer = prefer_grad_buffer_for_param_gather(
+            fp8_param_gather=self.ddp.fp8_param_gather,
+            fp8_recipe=getattr(transformer, "fp8_recipe", self.optimizer.fp8_recipe),
+            legacy_reuse=self.ddp.reuse_grad_buf_for_mxfp8_param_ag,
+            use_fsdp=self.ddp.use_megatron_fsdp or self.dist.use_torch_fsdp2,
+        )
+        if prefer_grad_buffer:
+            if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
+                raise ValueError(
+                    "Gradient-buffer offload is incompatible with parameter all-gather: "
+                    "parameters share the gradient-buffer storage that offload releases."
+                )
+            assert self.ddp.fp8_param_gather, "Legacy grad-buffer reuse requires fp8_param_gather."
+            if self.optimizer.overlap_param_gather_with_optimizer_step:
+                raise ValueError(
+                    "overlap_param_gather_with_optimizer_step is not supported when parameter "
+                    "all-gather stages master weights in gradient storage."
+                )
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""

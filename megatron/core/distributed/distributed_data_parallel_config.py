@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -87,10 +87,12 @@ class DistributedDataParallelConfig:
     """If true, keep the compute param in fp4 (do not use any other intermediate dtype) and
        perform the param all-gather in fp4."""
 
-    reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True: MXFP8 params
-       cannot be mapped into the param buffer. The training CLI sets it automatically."""
+    reuse_grad_buf_for_mxfp8_param_ag: Optional[bool] = field(
+        default=None, repr=False, metadata={"omit_if_none": True}
+    )
+    """Deprecated construction input for old Core callers and serialized configurations.
+    Leave unset to derive parameter-gather storage from the recipe and layout. Runtime
+    communication uses each buffer's ParamGatherPlan, not this compatibility input."""
 
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
@@ -325,38 +327,6 @@ class DistributedDataParallelConfig:
     DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
-
-    @property
-    def param_sync_via_bucket_group(self) -> bool:
-        """Whether DP parameter synchronization is dispatched through DDP bucket groups.
-
-        ``True``:
-        ``_ParamAndGradBucketGroup.start_param_sync()`` is the collective entry point. This is
-        the standard DistributedOptimizer path. LayerWise also uses it when overlap needs
-        bucket-level prefetch, or when MXFP8 reuse needs ``bucket.grad_data`` as the gather
-        buffer. With overlap, the current bucket's forward pre-hook waits for its gather and
-        dispatches the next bucket's gather before computation starts, allowing communication
-        for the next bucket to overlap with the current computation.
-
-        ``False``:
-        DDP bucket groups do not launch parameter all-gather. Then either:
-
-        - No gather is needed because every DP rank runs the same optimizer update.
-        - Another component performs the gather. With ``LayerWiseDistributedOptimizer``, this
-          happens for the compact layout (``second_order_optimizer_grad_collective="all-reduce"``)
-          when parameter-gather overlap and MXFP8 grad-buffer reuse are disabled. Each rank
-          updates only its assigned parameters, then the optimizer calls ``allgather_params()``
-          synchronously after the step.
-
-        Under the compact layout, DDP evaluates this property on the per-buffer config of the
-        LayerWise buffers, which has ``use_distributed_optimizer=False``.
-        """
-        if self.use_distributed_optimizer:
-            return True
-
-        # Without standard DistOpt (the compact LayerWise buffers), these flags select the
-        # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
-        return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
     def __post_init__(self):
         import os
