@@ -150,18 +150,17 @@ def test_resolve_param_layout_follows_the_grad_collective():
 
 
 @pytest.mark.parametrize(
-    ("kind", "reuse_grad_buf", "error"),
+    ("kind", "error"),
     [
-        ("bf16", False, None),
-        ("mxfp8", True, None),
+        ("bf16", None),
+        ("mxfp8", None),
         # Recipes the all-reduce collective can publish point there ...
-        ("mxfp8", False, "all-reduce"),
-        ("blockwise", True, "all-reduce"),
+        ("blockwise", "all-reduce"),
         # ... and the others, which no LayerWise gather publishes, to another recipe.
-        ("tensorwise", True, "mxfp8 or blockwise recipe"),
+        ("tensorwise", "mxfp8 or blockwise recipe"),
     ],
 )
-def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, reuse_grad_buf, error):
+def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, error):
     # The padded gather moves raw bytes; only MXFP8 staged through the grad buffer is
     # requantized on every rank, so other FP8 params would keep stale scales off-owner.
     optimizer = SimpleNamespace(param_groups=[{"params": [_param((8, 8))]}])
@@ -172,9 +171,7 @@ def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, reuse_gr
         mock.patch(f"{module}.is_blockwise_float8tensor", return_value=kind == "blockwise"),
         nullcontext() if error is None else pytest.raises(ValueError, match=error),
     ):
-        LayerWiseDistributedOptimizer._check_padded_param_gather_storage(
-            [optimizer], SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf)
-        )
+        LayerWiseDistributedOptimizer._check_padded_param_gather_storage([optimizer])
 
 
 # ---------------------------------------------------------------------------

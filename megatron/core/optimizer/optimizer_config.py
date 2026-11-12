@@ -4,11 +4,14 @@ import fnmatch
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 
 from ..utils import is_te_min_version
+
+if TYPE_CHECKING:
+    from ..distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -229,10 +232,12 @@ class OptimizerConfig:
     bf16: bool = False
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
-    reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True. The training
-       CLI sets it for every MXFP8 run with --fp8-param-gather outside FSDP."""
+    reuse_grad_buf_for_mxfp8_param_ag: Optional[bool] = field(
+        default=None, repr=False, metadata={"omit_if_none": True}
+    )
+    """Deprecated compatibility input, normalized before buffers are constructed.
+    New configurations leave this unset. Parameter staging and communication use the
+    resolved buffer plans, including for precisions other than MXFP8."""
 
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
@@ -439,11 +444,8 @@ class OptimizerConfig:
     ``torch_dist`` checkpoint saved with one loads with the other."""
 
     overlap_param_gather: bool = False
-    """If true, overlap param all-gather with forward compute. 
-        This argument is intended to have the same value as the "overlap_param_gather" argument 
-        in the "distributed_data_parallel_config.py" file. In the optimizer, this argument is 
-        only used when "reuse_grad_buf_for_mxfp8_param_ag=True & fp8_param_gather=True".
-    """
+    """Overlap parameter all-gather with forward compute. Training finalization supplies this
+    policy to DDP; an optimizer attached to DDP follows its buffers' actual schedule."""
 
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
@@ -539,12 +541,14 @@ class OptimizerConfig:
         if self.lr is not None and self.min_lr is not None:
             assert self.min_lr <= self.lr
 
-        if self.fp8_recipe == "mxfp8" and not self.reuse_grad_buf_for_mxfp8_param_ag:
+        if self.fp8_recipe == "mxfp8" and self.reuse_grad_buf_for_mxfp8_param_ag is False:
             import warnings
 
             warnings.warn(
-                "mxfp8 without reuse_grad_buf_for_mxfp8_param_ag uses significantly more GPU "
-                "memory; the training CLI enables it with --fp8-param-gather."
+                "reuse_grad_buf_for_mxfp8_param_ag is deprecated. Explicit False selects "
+                "temporary storage only for synchronous compact LayerWise gathers; fixed-shard "
+                "MXFP8 gathers always use master-weight staging. Leave it unset for automatic "
+                "selection."
             )
 
         if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:

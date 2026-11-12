@@ -9,7 +9,6 @@ import torch
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.extensions.transformer_engine import is_grouped_tensor_marked
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
@@ -1046,10 +1045,9 @@ def check_paged_stash_host_spill():
 class PagedStashRunner:
     """Runner for paged stash"""
 
-    def __init__(self, config, copy_main_params, model, optimizer, forward_backward_func):
+    def __init__(self, config, model, optimizer, forward_backward_func) -> None:
         self.stash_manager = PagedStashManager.get_instance()
         self.config = config
-        self.copy_main_params = copy_main_params
         self.model = model
         self.optimizer = optimizer
         self.forward_backward_func = forward_backward_func
@@ -1260,27 +1258,8 @@ class PagedStashRunner:
         if self.optimizer is not None:
             self.optimizer.zero_grad()
 
-        # _handle_mxfp8_param_buffer_copy
-        if self.copy_main_params:
-
-            def _try_copy_main_params(opt):
-                if (
-                    isinstance(opt, DistributedOptimizer)
-                    and hasattr(opt, 'shard_fp32_from_float16_groups')
-                    and opt.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                    and opt.ddp_config.overlap_param_gather
-                ):
-                    opt._copy_main_params_to_param_buffer()
-
-            # Handle both ChainedOptimizer and direct DistributedOptimizer cases
-            # Note: FSDP's DistributedOptimizer doesn't have shard_fp32_from_float16_groups,
-            # so we check for this attribute before calling _copy_main_params_to_param_buffer
-            if self.optimizer is not None:
-                if hasattr(self.optimizer, 'chained_optimizers'):
-                    for optim_instance in self.optimizer.chained_optimizers:
-                        _try_copy_main_params(optim_instance)
-                else:
-                    _try_copy_main_params(self.optimizer)
+        if self.optimizer is not None:
+            self.optimizer.stage_model_params_after_grad_buffer_reset()
 
         # Delete the CUDA graph before releasing stash tensors the captured graph may reference.
         if isinstance(self.forward_backward_func, FullCudaGraphWrapper):

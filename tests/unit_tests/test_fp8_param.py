@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import contextlib
 import gc
 import os
 import sys
@@ -17,7 +16,6 @@ from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
@@ -33,7 +31,6 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import (
     force_param_sync,
-    get_model,
     setup_model_and_optimizer,
     should_disable_forward_pre_hook,
 )
@@ -47,7 +44,7 @@ fp8_available, reason_for_no_fp8 = check_fp8_support()
 cuda_graph_supported = False
 reason_for_no_cuda_graph = ""
 try:
-    from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
+    from transformer_engine.pytorch.tensor.utils import post_all_gather_processing  # noqa: F401
 
     if is_te_min_version("2.10.0"):
         cuda_graph_supported = True
@@ -171,10 +168,6 @@ class TestFP8Param:
         args.fp8_param_gather = fp8_param_gather
         args.ddp_bucket_size = 1024  # Create more buckets to test the rs/ag overlap.
 
-        # MXFP8 test settings
-        if recipe == "mxfp8" and fp8_param_gather:
-            args.reuse_grad_buf_for_mxfp8_param_ag = True
-
         if use_cuda_graph:
             args.cuda_graph_impl = "transformer_engine"
             args.cuda_graph_warmup_steps = 0
@@ -206,20 +199,13 @@ class TestFP8Param:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def copy_main_params_to_param_buffer(self, model_chunks, optimizer):
-        # Mirrors MBridge's pre-eval fix: disable_forward_pre_hook(param_sync=True)
-        # force-syncs params before eval callbacks run, so MXFP8 must repopulate
-        # the shared param/grad buffer before disabling forward hooks.
-        for model_chunk in model_chunks:
-            model_chunk.zero_grad_buffer()
-        for optim_instance in optimizer.chained_optimizers:
-            if isinstance(optim_instance, DistributedOptimizer):
-                optim_instance._copy_main_params_to_param_buffer()
+        # Populate only the optimizer-owned shared buffers before a forced eval gather.
+        optimizer.prepare_model_params_for_param_sync()
 
     def run_eval_transition(self, args, model_chunks, optimizer, batch):
         input_ids, labels, position_ids, attention_mask, loss_mask = batch
 
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-            self.copy_main_params_to_param_buffer(model_chunks, optimizer)
+        self.copy_main_params_to_param_buffer(model_chunks, optimizer)
 
         if should_disable_forward_pre_hook(args, optimizer):
             disable_forward_pre_hook(model_chunks, param_sync=True)
@@ -364,7 +350,7 @@ class TestFP8Param:
 
         # Verify that bf16 params (embedding, LN, etc.) in the MXFP8 model are mapped
         # to the param buffer (shared with grad buffer) rather than allocated separately.
-        if args.reuse_grad_buf_for_mxfp8_param_ag:
+        if args.fp8_recipe == "mxfp8" and args.fp8_param_gather:
             for buffer in gpt_model[0].buffers:
                 if buffer.param_data is None:
                     continue
@@ -432,18 +418,12 @@ class TestFP8Param:
                     enable_forward_pre_hook(gpt_model)
                     self.cuda_graph_helper.cuda_graph_set_manual_hooks()
 
-            # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-            # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
-            # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+            # Restore shared gather inputs only once forward hooks will consume them.
             forward_pre_hook_enabled = bool(
                 getattr(gpt_model[0], 'remove_forward_pre_hook_handles', {})
             )
-            if (
-                args.reuse_grad_buf_for_mxfp8_param_ag
-                and args.overlap_param_gather
-                and forward_pre_hook_enabled
-            ):
-                self.copy_main_params_to_param_buffer(gpt_model, optimizer)
+            if forward_pre_hook_enabled:
+                optimizer.stage_model_params_after_grad_buffer_reset()
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -595,7 +575,7 @@ class TestFP8Param:
     @pytest.mark.parametrize("dp_overlap", [(True, True)])
     def test_blockwise_scaling(self, tp_size, dp_overlap):
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
-        self.run_test(tp_size=tp_size, recipe="blockwise")
+        self.run_test(tp_size=tp_size, recipe="blockwise", **kwargs)
 
     @pytest.mark.skipif(
         get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
@@ -810,8 +790,7 @@ class TestFP8Param:
         for _ in range(num_steps):
             model[0].zero_grad_buffer()
             optimizer.zero_grad()
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                self.copy_main_params_to_param_buffer(model, optimizer)
+            optimizer.stage_model_params_after_grad_buffer_reset()
             model[0].set_is_first_microbatch()
             output = model[0].forward(
                 input_ids=input_ids,
@@ -841,8 +820,8 @@ class TestFP8Param:
     @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
     # MXFP8 params cannot be re-homed into the DDP param buffer ("replace_raw_data for
-    # MXFP8Tensor is not supported yet"), so mxfp8 + --fp8-param-gather always runs with
-    # reuse_grad_buf_for_mxfp8_param_ag. That covers the shared param/grad buffer branch of
+    # MXFP8Tensor is not supported yet"), so mxfp8 + --fp8-param-gather selects master-weight
+    # gather storage automatically. That covers the shared param/grad buffer branch of
     # the re-derivation; tensorwise and delayed cover the direct quantize_param_shard branch.
     # LayerWiseDistributedOptimizer is a ChainedOptimizer nested inside the outer one, so
     # it re-derives through ChainedOptimizer._stage_model_params_from_main_params. Covered
@@ -851,16 +830,11 @@ class TestFP8Param:
     # DistributedOptimizer quantizes from bf16(main), so the two derive different tensorwise
     # scales from a checkpoint that stores BF16.
     @pytest.mark.parametrize(
-        ("recipe", "reuse_grad_buf", "optimizer_name"),
-        [
-            ("mxfp8", True, "adam"),
-            ("tensorwise", False, "adam"),
-            ("delayed", False, "adam"),
-            ("mxfp8", True, "muon"),
-        ],
+        ("recipe", "optimizer_name"),
+        [("mxfp8", "adam"), ("tensorwise", "adam"), ("delayed", "adam"), ("mxfp8", "muon")],
     )
     def test_fp8_param_checkpoint_resume_is_bitwise_exact(
-        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe, reuse_grad_buf, optimizer_name
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe, optimizer_name
     ):
         """A resumed run must hold exactly the quantized weights the saving run held.
 
@@ -887,7 +861,6 @@ class TestFP8Param:
         kwargs = {
             "overlap_param_gather": True,
             "overlap_grad_reduce": True,
-            "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf,
             "optimizer": optimizer_name,
         }
         if optimizer_name == "muon":
@@ -960,11 +933,7 @@ class TestFP8Param:
         # TE refuses to load a pickled extra state by default. This checkpoint is created by
         # the test and is therefore trusted.
         monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
-        kwargs = {
-            "overlap_param_gather": True,
-            "overlap_grad_reduce": True,
-            "reuse_grad_buf_for_mxfp8_param_ag": recipe == "mxfp8",
-        }
+        kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
         Utils.initialize_distributed()
         with TempNamedDir(
             tmp_path_dist_ckpt / "test_fp8_ckpt_stream_dequant", sync=True

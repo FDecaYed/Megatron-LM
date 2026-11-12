@@ -5,6 +5,8 @@ from unittest.mock import Mock
 
 import torch
 
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.transformer.moe.paged_stash import PagedStashManager, PagedStashRunner
 
 
@@ -111,7 +113,6 @@ def _run_retry(
     monkeypatch.setattr(PagedStashManager, 'STASH_MGR', fake_stash_manager)
     runner = PagedStashRunner(
         config=training_config,
-        copy_main_params=False,
         model=[model],
         optimizer=None,
         forward_backward_func=forward_backward_func,
@@ -207,44 +208,48 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
     ) == (True, True, True, False)
 
 
-def test_retry_stages_only_overlapped_reused_mxfp8_buffers(monkeypatch):
-    class _DistributedOptimizer:
+def test_retry_restores_only_shared_overlapped_gather_inputs(monkeypatch):
+    class Optimizer:
+        stage_model_params_after_grad_buffer_reset = (
+            DistributedOptimizer.stage_model_params_after_grad_buffer_reset
+        )
 
-        def __init__(self, *, reuse_grad_buffer, overlap_param_gather):
-            self.ddp_config = SimpleNamespace(
-                reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buffer,
-                overlap_param_gather=overlap_param_gather,
-            )
-            self.shard_fp32_from_float16_groups = []
-            self._copy_main_params_to_param_buffer = Mock()
+        def __init__(self, *, shared, overlap):
+            self.is_stub_optimizer = False
+            self.requires_param_buffer_staging = shared
+            self.ddp_config = SimpleNamespace(use_megatron_fsdp=False, overlap_param_gather=overlap)
+            self.storage = torch.full((2,), -1.0)
+            self.master = torch.tensor([3.0, 7.0])
 
-    overlapped = _DistributedOptimizer(reuse_grad_buffer=True, overlap_param_gather=True)
-    nonoverlapped = _DistributedOptimizer(reuse_grad_buffer=True, overlap_param_gather=False)
-    dedicated_buffer = _DistributedOptimizer(reuse_grad_buffer=False, overlap_param_gather=True)
-    optimizer = SimpleNamespace(
-        zero_grad=Mock(), chained_optimizers=[overlapped, nonoverlapped, dedicated_buffer]
+        def zero_grad(self, *args, **kwargs):
+            pass
+
+        def _copy_main_params_to_param_buffer(self):
+            self.storage.copy_(self.master)
+
+    members = [
+        Optimizer(shared=True, overlap=True),
+        Optimizer(shared=True, overlap=False),
+        Optimizer(shared=False, overlap=True),
+    ]
+    optimizer = ChainedOptimizer(members)
+    model_chunk = SimpleNamespace(
+        zero_grad_buffer=lambda: [member.storage.zero_() for member in members]
     )
-    model_chunk = SimpleNamespace(zero_grad_buffer=Mock())
-    stash_manager = SimpleNamespace(overflow=None, host_spill=None, release_stash_buffers=Mock())
     runner = PagedStashRunner.__new__(PagedStashRunner)
     runner.moe_layers = []
     runner._required_recv_capacity = None
-    runner.stash_manager = stash_manager
-    runner.copy_main_params = True
+    runner.stash_manager = SimpleNamespace(
+        overflow=None, host_spill=None, release_stash_buffers=Mock()
+    )
     runner.model = [model_chunk]
     runner.optimizer = optimizer
     runner.forward_backward_func = object()
     runner._set_moe_paged_stash_all = Mock()
-
-    monkeypatch.setattr(
-        "megatron.core.transformer.moe.paged_stash.DistributedOptimizer", _DistributedOptimizer
-    )
     monkeypatch.setattr(
         "megatron.core.transformer.moe.paged_stash.nccl_ep_release_context", lambda: None
     )
-
     runner.prepare_for_rerun()
-
-    overlapped._copy_main_params_to_param_buffer.assert_called_once_with()
-    nonoverlapped._copy_main_params_to_param_buffer.assert_not_called()
-    dedicated_buffer._copy_main_params_to_param_buffer.assert_not_called()
+    torch.testing.assert_close(members[0].storage, members[0].master, rtol=0, atol=0)
+    for member in members[1:]:
+        assert torch.count_nonzero(member.storage) == 0

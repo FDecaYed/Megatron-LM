@@ -13,11 +13,70 @@ wipe the non-quantized weights that alias it. ``_post_param_sync`` skips exactly
 buckets for that reason. None of this needs a GPU to pin.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
+import torch
 
+from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
+from megatron.core.distributed.param_and_grad_buffer import (
+    _ParamAndGradBucket,
+    _ParamAndGradBucketGroup,
+    bind_param_sync_bucket_groups,
+)
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
+from megatron.core.optimizer.param_layout import ParamGatherPlan
+
+
+def test_optimizer_publishes_only_its_bound_ddp_groups():
+    """One chunk, two owners: an optimizer must not publish a sibling's stale gather payload."""
+    params = [torch.nn.Parameter(torch.tensor([1.0])), torch.nn.Parameter(torch.tensor([2.0]))]
+    groups, buffers = [], []
+    for param, payload in zip(params, (10.0, 99.0)):
+        bucket = _ParamAndGradBucket(
+            [param],
+            torch.tensor([payload]),
+            torch.zeros(1),
+            0,
+            1,
+            1.0,
+            0,
+            {param: (0, 1, 0)},
+            [],
+            param_gather_plan=ParamGatherPlan.MODEL_BUFFER,
+        )
+        group = _ParamAndGradBucketGroup.__new__(_ParamAndGradBucketGroup)
+        group.buckets = [bucket]
+        group.ddp_config = SimpleNamespace(use_distributed_optimizer=True)
+        # Communication is outside this ownership test; publish the received CPU payload.
+        group.start_param_sync = lambda force_sync=False, group=group: group._post_param_sync()
+        groups.append(group)
+        buffers.append(SimpleNamespace(buckets=[bucket]))
+    chunk = SimpleNamespace(bucket_groups=[groups[0]], expert_parallel_bucket_groups=[groups[1]])
+    chunk._start_bucket_group_param_sync = MethodType(
+        DistributedDataParallel._start_bucket_group_param_sync, chunk
+    )
+    optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
+    optimizer.param_sync_bucket_groups = bind_param_sync_bucket_groups([chunk], buffers[:1])
+    optimizer.start_param_sync_for_bucket_group_subset()
+    assert params[0].item() == 10.0
+    assert params[1].item() == 2.0
+    assert optimizer.param_sync_bucket_groups[0][1] is groups[0]
+
+
+def test_parameter_sync_rejects_partial_or_duplicate_group_ownership():
+    first, second = object(), object()
+    group = SimpleNamespace(buckets=[first, second])
+    chunk = SimpleNamespace(bucket_groups=[group], expert_parallel_bucket_groups=[])
+    with pytest.raises(AssertionError, match="multiple optimizer owners"):
+        bind_param_sync_bucket_groups([chunk], [SimpleNamespace(buckets=[first])])
+    config = SimpleNamespace()
+    owners = [
+        SimpleNamespace(config=config, param_sync_bucket_groups=[(chunk, group)]) for _ in range(2)
+    ]
+    with pytest.raises(AssertionError, match="cannot own the same DDP bucket group"):
+        ChainedOptimizer(owners)
 
 
 class _FakeModelChunk:

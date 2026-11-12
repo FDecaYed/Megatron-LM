@@ -11,9 +11,74 @@ buffers consume the resulting layouts without any optimizer-specific knowledge.
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+
+
+class ParamGatherPlan(Enum):
+    """Resolved parameter communication, owned by a buffer rather than a user config.
+
+    Only the existing execution modes are represented. In particular, the dispatcher is
+    implied by the mode, and borrowing gradient storage does not imply quantized parameters.
+    Tensor-format-specific packing and publication remain with the buffer's existing helpers.
+    """
+
+    NONE = "none"
+    MODEL_BUFFER = "model_buffer"
+    MASTER_BUFFER = "master_buffer"
+    WHOLE_PARAMS_GRAD_BUFFER = "whole_params_grad_buffer"
+    WHOLE_PARAMS_TEMPORARY = "whole_params_temporary"
+
+    @property
+    def via_bucket_group(self) -> bool:
+        return self not in (self.NONE, self.WHOLE_PARAMS_TEMPORARY)
+
+    @property
+    def uses_grad_buffer(self) -> bool:
+        return self in (self.MASTER_BUFFER, self.WHOLE_PARAMS_GRAD_BUFFER)
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        sharded: bool,
+        layer_wise: bool,
+        requires_master_gather: bool,
+        overlap: bool,
+        prefer_grad_buffer: bool,
+    ) -> "ParamGatherPlan":
+        """Select a legal mode once, before buffer allocation or hook registration."""
+        if sharded:
+            # MXFP8 storage cannot alias the persistent DDP parameter buffer. Its fixed-shard
+            # gather stages master values in a BF16 view and quantizes after communication.
+            return cls.MASTER_BUFFER if requires_master_gather else cls.MODEL_BUFFER
+        if not layer_wise:
+            return cls.NONE
+        if overlap or prefer_grad_buffer:
+            return cls.WHOLE_PARAMS_GRAD_BUFFER
+        return cls.WHOLE_PARAMS_TEMPORARY
+
+
+def prefer_grad_buffer_for_param_gather(
+    *,
+    fp8_param_gather: bool,
+    fp8_recipe: Optional[Union[str, Enum]],
+    legacy_reuse: Optional[bool] = None,
+    use_fsdp: bool = False,
+) -> bool:
+    """Normalize the deprecated reuse input at construction/config-validation boundaries.
+
+    New callers let the recipe determine the policy. An explicit legacy False still selects
+    the compact synchronous temporary-buffer path for direct Core callers. Runtime code uses
+    ParamGatherPlan; this preference is not a statement about an allocated buffer's storage.
+    """
+    if use_fsdp:
+        return False
+    if legacy_reuse is not None:
+        return legacy_reuse
+    return fp8_param_gather and getattr(fp8_recipe, "value", fp8_recipe) == "mxfp8"
 
 
 def pad_to_divisor(value: int, divisor: int) -> int:

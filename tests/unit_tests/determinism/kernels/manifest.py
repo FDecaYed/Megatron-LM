@@ -662,7 +662,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
         "logging) launch the same multi_tensor kernels through multi_tensor_applier. The opt-in "
         "per-head split-QKV Muon update (batched Newton-Schulz per head width) is replayed in "
-        "test_optimizer_kernels.py.",
+        "test_optimizer_kernels.py. Chained parameter-gather input staging after gradient reset "
+        "is replayed bit-exactly under side-stream contention in the same suite.",
     ),
     KernelEntry(
         name="tensor_metric_l2",

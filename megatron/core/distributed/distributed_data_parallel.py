@@ -10,7 +10,7 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..optimizer.param_layout import FullParamLayout
+from ..optimizer.param_layout import FullParamLayout, prefer_grad_buffer_for_param_gather
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
@@ -23,7 +23,12 @@ except ImportError:
 
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
+from .param_and_grad_buffer import (
+    _ParamAndGradBucketGroup,
+    _ParamAndGradBuffer,
+    group_params_for_buffers,
+    partition_buckets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,14 +118,20 @@ class DistributedDataParallel(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> None:
         """Validate resolved buffer policy and model settings before wrapper setup."""
-        if ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+        prefer_grad_buffer = prefer_grad_buffer_for_param_gather(
+            fp8_param_gather=ddp_config.fp8_param_gather,
+            fp8_recipe=config.fp8_recipe,
+            legacy_reuse=ddp_config.reuse_grad_buf_for_mxfp8_param_ag,
+            use_fsdp=ddp_config.use_megatron_fsdp,
+        )
+        if prefer_grad_buffer:
             assert (
                 ddp_config.fp8_param_gather
             ), "Reuse grad buffer only when keeping params in MXFP8."
             if ddp_config.grad_buffer_offload:
                 raise ValueError(
                     "Gradient-buffer offload is incompatible with "
-                    "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+                    "parameter all-gather through shared gradient storage."
                 )
 
         if config.moe_virtual_expert_load_balance and config.fp8:
@@ -128,10 +139,10 @@ class DistributedDataParallel(_BaseDataParallel):
                 raise ValueError(
                     "MoonEP with MXFP8 requires fp8_param_gather=True (--fp8-param-gather)."
                 )
-            if not ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            if not prefer_grad_buffer:
                 raise ValueError(
-                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True, which "
-                    "the training CLI sets for --fp8-recipe mxfp8 with --fp8-param-gather."
+                    "MoonEP with MXFP8 requires the automatically selected master-weight "
+                    "parameter gather; an explicit legacy reuse=False is incompatible."
                 )
 
     def __init__(
@@ -329,6 +340,12 @@ class DistributedDataParallel(_BaseDataParallel):
         # Allocate buffers for each group.
         self.buffers = []
         self.expert_parallel_buffers = []
+        prefer_grad_buffer = prefer_grad_buffer_for_param_gather(
+            fp8_param_gather=self.ddp_config.fp8_param_gather,
+            fp8_recipe=config.fp8_recipe,
+            legacy_reuse=self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag,
+            use_fsdp=self.ddp_config.use_megatron_fsdp,
+        )
         pg_collection = ProcessGroupCollection(
             tp=self.tp_group,
             dp_cp=self.dp_cp_group,
@@ -403,6 +420,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
+                prefer_grad_buffer=prefer_grad_buffer,
             )
             if buffer_key.is_expert_parallel:
                 self.expert_parallel_buffers.append(buffer)
@@ -692,14 +710,9 @@ class DistributedDataParallel(_BaseDataParallel):
         their parameters are published by the owning optimizer (the compact LayerWise layout
         without overlap or grad-buffer reuse gathers in ``allgather_params()``).
         """
-        if not bucket_group.ddp_config.param_sync_via_bucket_group:
+        if not bucket_group.param_sync_via_bucket_group:
             return
         bucket_group.start_param_sync(force_sync=force_sync)
-
-        if self.ddp_config.overlap_param_gather:
-            return
-
-        bucket_group._post_param_sync()
 
     def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
         """
@@ -723,9 +736,11 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
-    def reset_param_sync_dispatch_state(self):
+    def reset_param_sync_dispatch_state(self, bucket_groups=None):
         """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        if bucket_groups is None:
+            bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        for bucket_group in bucket_groups:
             # A non-None handle means the previous all-gather is still in flight. Resetting only
             # the dispatch flag would create the invalid state
             # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a

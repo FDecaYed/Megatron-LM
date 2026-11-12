@@ -514,3 +514,24 @@ def test_ddp_bucket_resolution_is_idempotent_and_round_trips(
         restored.ddp.num_buckets = 4
         restored.ddp.resolve_bucket_size(num_parameters=8192, data_parallel_size=2)
         assert restored.ddp.bucket_size == (2048 if overlap else None)
+
+
+@pytest.mark.parametrize("legacy_reuse", [None, False, True])
+def test_legacy_gather_input_round_trip_preserves_offload_validation(run_config, legacy_reuse):
+    run_config.model.transformer.fp8 = "hybrid"
+    run_config.model.transformer.fp8_recipe = "mxfp8"
+    run_config.ddp.fp8_param_gather = True
+    run_config.ddp.grad_buffer_offload = True
+    run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = None
+    run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = legacy_reuse
+    serialized = run_config.to_dict()
+    if legacy_reuse is None:
+        assert "reuse_grad_buf_for_mxfp8_param_ag" not in serialized["optimizer"]
+        assert "reuse_grad_buf_for_mxfp8_param_ag" not in serialized["ddp"]
+    restored = type(run_config).from_dict(serialized)
+    for cfg in (run_config, restored):
+        if legacy_reuse is False:
+            cfg._validate_ddp_config()
+        else:
+            with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
+                cfg._validate_ddp_config()

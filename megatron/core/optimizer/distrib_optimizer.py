@@ -50,8 +50,8 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
+    bind_param_sync_bucket_groups,
     group_params_for_buffers,
-    partition_buckets,
 )
 from ..fp4_utils import is_grouped_nvfp4tensor, is_nvfp4tensor, quantize_nvfp4_param_shard
 from ..fp8_utils import (
@@ -74,7 +74,13 @@ from .optimizer import (
     get_param_group_identifier_tuple,
 )
 from .optimizer_config import OptimizerConfig
-from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
+from .param_layout import (
+    FullParamLayout,
+    ParamGatherPlan,
+    PerBufferParamLayout,
+    pad_bucket_end,
+    pad_param_start,
+)
 
 logger = getLogger(__name__)
 
@@ -851,6 +857,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
+        self.param_sync_bucket_groups = []
+        self.requires_param_buffer_staging = False
         # Retained only between loading-template creation and load_state_dict().
         self._checkpoint_version_for_load = None
 
@@ -901,9 +909,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.gbuf_idx_to_model_idx_map[gbuf_idx] = model_idx
                 gbuf_idx += 1
 
-        self.per_model_bucket_groups = {}
-        for model_idx, buffers in self.per_model_buffers.items():
-            self.per_model_bucket_groups[model_idx] = partition_buckets(buffers)
+        self.param_sync_bucket_groups = bind_param_sync_bucket_groups(model_chunks, self.buffers)
+        self.requires_param_buffer_staging = any(
+            buffer.param_gather_plan is ParamGatherPlan.MASTER_BUFFER for buffer in self.buffers
+        )
+        if self.requires_param_buffer_staging and config.overlap_param_gather_with_optimizer_step:
+            raise ValueError(
+                "overlap_param_gather_with_optimizer_step is not supported when parameter "
+                "all-gather stages master weights in gradient storage."
+            )
 
         self.gbuf_ranges = []
         self.per_bucket_numel = []
@@ -2541,7 +2555,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 if data_parallel_rank == 0:
-                    buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                     model_numels = [b.numel_unpadded for b in self.buffers[gbuf_idx].buckets]
                     checkpoint_numels = [
                         t.numel() for t in state_dict[gbuf_idx][torch.float32]["param"]
@@ -2575,9 +2588,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Scatter tensor list.
                         if data_parallel_rank == 0:
-
-                            start = offset_in_world_tensors
-                            end = offset_in_world_tensors + gbuf_world_numel_unpadded
 
                             world_tensor = legacy_world_tensors[bucket_idx]
                             assert (
@@ -3278,23 +3288,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Stage FP32 master shards into DDP param buffers before explicit param sync."""
         if self.is_stub_optimizer:
             return
-        if not (self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather):
+        if not (self.requires_param_buffer_staging and self.ddp_config.overlap_param_gather):
             return
 
-        for model_chunk in self.model_chunks:
-            model_chunk.zero_grad_buffer()
+        for buffer in self.buffers:
+            if buffer.param_gather_plan is ParamGatherPlan.MASTER_BUFFER:
+                buffer.reset()
         self._copy_main_params_to_param_buffer()
 
     @torch.no_grad()
     def _stage_model_params_from_main_params(self) -> None:
         if self.is_stub_optimizer:
             return
-        if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+        if self.requires_param_buffer_staging:
             # MXFP8 reuses the grad buffer for the param all-gather; the quantization
             # happens after the all-gather, in _post_param_sync.
             self._copy_main_params_to_param_buffer()
         else:
             self._copy_main_params_to_model_params()
+
+    def _copy_main_params_after_optimizer_step(self) -> None:
+        """Defer shared-buffer staging until after gradient reset for overlapped gathers."""
+        if not (self.requires_param_buffer_staging and self.ddp_config.overlap_param_gather):
+            self._stage_model_params_from_main_params()
 
     @torch.no_grad()
     def quantize_and_sync_model_params_from_main_params(self) -> None:
@@ -3339,8 +3355,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Staging params into the DDP param buffer invalidates any prior "already
         # dispatched" state. The next forward pre-hook must run post-sync cleanup,
         # especially when MXFP8 reuses grad_data as the param AG buffer.
+        # Only invalidate this optimizer's groups. A sibling may already have published its
+        # parameters and offloaded the masters used to produce them.
         for model_chunk in self.model_chunks:
-            model_chunk.reset_param_sync_dispatch_state()
+            owned_groups = [
+                group for chunk, group in self.param_sync_bucket_groups if chunk is model_chunk
+            ]
+            model_chunk.reset_param_sync_dispatch_state(owned_groups)
+
+    @torch.no_grad()
+    def stage_model_params_after_grad_buffer_reset(self) -> None:
+        """Restore this optimizer's gather inputs without clearing gradients or dispatching."""
+        if (
+            not self.is_stub_optimizer
+            and not self.ddp_config.use_megatron_fsdp
+            and self.requires_param_buffer_staging
+            and self.ddp_config.overlap_param_gather
+        ):
+            self._copy_main_params_to_param_buffer()
 
     @staticmethod
     def _normalize_state_dict_for_grouped_params(state_dict_flat, model_chunk):
@@ -3592,20 +3624,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
         so FP8 post-all-gather processing (and MXFP8 copy) still runs.
         """
-        # Deferred import: layer_wise_optimizer's compute_full_param_layout
-        # lazily imports DistributedOptimizer, so importing the helper at
-        # module load here would create a cycle.
-        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
-
-        for model_chunk in self.model_chunks:
-            for bucket_group in (
-                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
-            ):
-                if not bucket_group.buckets:
-                    continue
-                if _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0]):
-                    continue
-                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+        for model_chunk, bucket_group in self.param_sync_bucket_groups:
+            model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
@@ -3615,9 +3635,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         update_successful = super().step_with_ready_grads()
 
-        should_sync_params = not self.ddp_config.overlap_param_gather and not getattr(
-            self, '_defer_param_sync', False
-        )
+        should_sync_params = not self.ddp_config.overlap_param_gather
         timers = self.config.timers
         if timers is not None and (self.ddp_config.use_megatron_fsdp or should_sync_params):
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)

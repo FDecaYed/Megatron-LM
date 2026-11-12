@@ -25,6 +25,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer.param_layout import prefer_grad_buffer_for_param_gather
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.core.utils import is_te_min_version, is_torch_min_version
@@ -554,16 +555,27 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     def _validate_ddp_config(self) -> None:
         """Check wrapper requirements without deriving or mutating other configs."""
-        # DDP's copy is derived during finalization; recipes only set optimizer policy.
-        if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
+        transformer = getattr(self.model, "transformer", None)
+        prefer_grad_buffer = prefer_grad_buffer_for_param_gather(
+            fp8_param_gather=self.ddp.fp8_param_gather,
+            fp8_recipe=getattr(transformer, "fp8_recipe", self.optimizer.fp8_recipe),
+            legacy_reuse=self.optimizer.reuse_grad_buf_for_mxfp8_param_ag,
+            use_fsdp=self.ddp.use_megatron_fsdp
+            or isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
+        )
+        if prefer_grad_buffer:
             if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
                 raise ValueError(
                     "Gradient-buffer offload is incompatible with "
                     "--reuse-grad-buf-for-mxfp8-param-ag: "
                     "parameters share the gradient-buffer storage that offload releases."
                 )
-            assert self.ddp.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
-        transformer = getattr(self.model, "transformer", None)
+            assert self.ddp.fp8_param_gather, "Legacy grad-buffer reuse requires fp8_param_gather."
+            if self.optimizer.overlap_param_gather_with_optimizer_step:
+                raise ValueError(
+                    "overlap_param_gather_with_optimizer_step is not supported when parameter "
+                    "all-gather stages master weights in gradient storage."
+                )
         if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
             if self.ddp.use_megatron_fsdp:
                 raise ValueError("Torch FSDP2 and Megatron FSDP cannot be used together.")
@@ -783,8 +795,8 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.ddp.reduce_scatter_with_fp32_accumulation = False
             self.ddp.gtp_remat_reduce_scatter_with_fp32_accumulation = False
         if self.ddp.use_megatron_fsdp:
-            self.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
-            self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
+            self.ddp.reuse_grad_buf_for_mxfp8_param_ag = None
+            self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = None
             if self.ddp.megatron_fsdp_version == 1:
                 self.optimizer.use_distributed_optimizer = True
                 self.ddp.megatron_fsdp_use_decoupled_grad = (

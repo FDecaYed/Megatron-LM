@@ -1070,12 +1070,9 @@ def validate_args(args, defaults={}):
             'reused for the MXFP8 parameter all-gather whenever --fp8-param-gather is set.',
             args.rank,
         )
-    args.reuse_grad_buf_for_mxfp8_param_ag = (
-        args.fp8 is not None
-        and args.fp8_recipe == 'mxfp8'
-        and args.fp8_param_gather
-        and not (args.use_megatron_fsdp or args.use_torch_fsdp2)
-    )
+    # Keep the deprecated spelling readable, but do not turn a derived execution choice
+    # back into a user configuration field. Buffer construction resolves the actual plan.
+    args.reuse_grad_buf_for_mxfp8_param_ag = None
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -2902,9 +2899,8 @@ def _add_mixed_precision_args(parser):
                        help='Output dtype for the language-model output-layer GEMM. When the '
                        'requested dtype differs from the input dtype, Transformer Engine '
                        'general_gemm is used. By default, logits use the output-layer input dtype.')
-    group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
-                       help='Deprecated and ignored: the grad buffer is reused for the MXFP8 '
-                       'parameter all-gather whenever --fp8-param-gather is set.')
+    group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true', default=None,
+                       help=argparse.SUPPRESS)
     group.add_argument('--mamba-training-ssm-states-dtype', type=str,
                        choices=['fp32', 'bf16'], default=None,
                        help='Dtype of the materialized inter-chunk SSM states in Mamba training')

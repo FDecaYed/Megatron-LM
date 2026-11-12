@@ -1127,7 +1127,9 @@ def test_bucket_groups_keep_the_config_of_their_buffer(monkeypatch, layer_wise_f
             ddp_config=ddp_config,
             data_parallel_group=SimpleNamespace(rank=lambda: 0),
             data_parallel_world_size=1,
-            buckets=[SimpleNamespace(params_list=[param]) for param in params],
+            buckets=[
+                SimpleNamespace(params_list=[param], param_gather_plan=None) for param in params
+            ],
         )
 
     layer_wise = fake_buffer(torch.uint8, True, layer_wise_config)

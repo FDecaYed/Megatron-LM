@@ -145,10 +145,6 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         assert args.fp8 is not None
         if gtp_enabled:
             assert native_mxfp8, "GTP with the MXFP8 recipe requires FP8 parameter gather"
-        if native_mxfp8:
-            assert args.reuse_grad_buf_for_mxfp8_param_ag
-        else:
-            assert not args.reuse_grad_buf_for_mxfp8_param_ag
         assert args.muon_scalar_optimizer == "adam"
         assert optimizer.config.decoupled_weight_decay, "Scalar Adam must use AdamW semantics"
 
@@ -590,7 +586,7 @@ class TestGTPFp8ParamGather:
         The reference disables grouped-tensor execution and the TE op fuser; the target enables
         both. Everything else is identical: MXFP8 primary weights, parameter gather, grad-buffer
         reuse, padded LayerWise layout, and overlap. The target therefore reaches
-        ``_stage_layerwise_mxfp8_params`` through the fused implementation's forwarded pre-hooks.
+        ``_stage_layerwise_master_params`` through the fused implementation's forwarded pre-hooks.
         """
         if Utils.world_size != 4:
             pytest.skip("Requires exactly 4 torchrun ranks for EP2 x EDP2")

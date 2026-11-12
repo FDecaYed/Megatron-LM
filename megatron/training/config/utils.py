@@ -53,6 +53,10 @@ def serialize_dataclass(
         if field.name.startswith("_") or field.name in skip_fields:
             continue
         value = getattr(config, field.name)
+        # Compatibility inputs need to round-trip when explicitly supplied, but should not
+        # reappear as configurable switches in newly serialized recipes.
+        if value is None and field.metadata.get("omit_if_none", False):
+            continue
         if encode_callables and callable(value) and (
             isinstance(value, type) or not is_dataclass(value)
         ):

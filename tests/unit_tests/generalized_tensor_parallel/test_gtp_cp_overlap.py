@@ -166,7 +166,7 @@ def _step(model, optimizer, pg, step):
         gradients = {n: p.main_grad.clone() for n, p in model.module.named_parameters()}
     success, norm, _ = optimizer.step()
     assert success
-    if model.ddp_config.param_sync_via_bucket_group:
+    if any(group.param_sync_via_bucket_group for group in model.bucket_groups):
         model.start_param_sync(force_sync=True)
     return (
         float(norm),

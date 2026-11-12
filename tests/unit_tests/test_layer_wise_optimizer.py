@@ -515,10 +515,11 @@ class TestLayerWiseOptimizer:
                 assert len(owners) == 1, "A bucket group mixes LayerWise and DistOpt buckets"
                 if owners.pop():
                     # Without overlap the optimizer gathers the LayerWise params after its step.
-                    assert bucket_group.ddp_config.param_sync_via_bucket_group == overlap
+                    assert bucket_group.param_sync_via_bucket_group == overlap
         _assert_trains_like_reference(model, optimizer, steps=3)
 
-    def test_all_reduce_training_replays_bit_exact(self):
+    @pytest.mark.parametrize("overlap", [False, True])
+    def test_all_reduce_training_replays_bit_exact(self, overlap):
         """Gradient all-reduce next to the sibling DistOpt reduce-scatter, rank-consistent owners
         and uneven whole-param gathers replay bit for bit."""
         from tests.unit_tests.determinism.kernels.harness import bytes_equal
@@ -527,7 +528,7 @@ class TestLayerWiseOptimizer:
         for _ in range(2):
             model, optimizer, _ = _create(
                 grad_collective='all-reduce',
-                overlap_param_gather=True,
+                overlap_param_gather=overlap,
                 grad_reduce_in_fp32=True,
                 bucket_size=4096,
             )
