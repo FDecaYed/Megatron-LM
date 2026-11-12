@@ -109,7 +109,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dev_sync_kernels.py",),
         kind="torch-op",
         notes="CP1 packed roll forward/backward with repeated static metadata boundaries "
-        "and physical padding not represented by logical documents.",
+        "and physical padding not represented by logical documents. The same file replays the "
+        "Attention Residuals MTP output head: MultiTokenPredictionLayer._postprocess aggregating "
+        "the trunk depth-source tuple (MultiTokenPredictionInputs.attn_res_sources) with the "
+        "depth's final_attn_res before the final layernorm.",
     ),
     KernelEntry(
         name="dev_csa_packed_compaction_and_routing",
@@ -335,6 +338,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
         "standalone replay is in test_fused_activations. The DSv4 module tests cover static-spec "
         "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
+    ),
+    KernelEntry(
+        name="attention_residual_aggregation",
+        sources=("megatron/core/transformer/attention_residual.py",),
+        tests=(K + "test_attn_res_aggregation.py", K + "test_dev_sync_kernels.py"),
+        kind="torch.compile",
+        notes="AttentionResidual depth-softmax aggregation (fp32 statistics, RMSNorm keys) on "
+        "its three attn_res_impl backends: the eager memory-lean custom Function (gemv "
+        "parameter-gradient reduction over tokens), the torch.compile plain-autograd math and "
+        "FLA's fused_attnres, including the fused output RMSNorm of attn_res_norm_fusion. "
+        "test_dev_sync_kernels.py replays the MTP depth output head built on it. The 'attn_res' "
+        "output-discarding recompute path (CheckpointWithoutOutput) re-runs the same kernels and "
+        "is covered functionally by tests/unit_tests/transformer/test_attention_residual.py.",
     ),
     # ---------------------------------------------------------------- Megatron Triton fusions
     KernelEntry(
@@ -748,6 +764,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/optimizer/test_muon_grouped_projection.py",
+            "tests/unit_tests/determinism/kernels/test_optimizer_kernels.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
@@ -1073,10 +1091,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="muon_newton_schulz_dispatch",
-        sources=("megatron/core/optimizer/layer_sharded_muon.py",),
+        sources=(
+            "megatron/core/optimizer/layer_sharded_muon.py",
+            "megatron/core/optimizer/emerging_optimizers.py",
+        ),
         tests=(
             "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
             "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
+            "tests/unit_tests/optimizer/test_muon_grouped_projection.py",
         ),
         kind="dispatch",
         notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "
@@ -1086,7 +1108,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_layer_sharded_muon.py (test_step_matches_duplicated_mode, "
         "test_batched_matches_unbatched, test_concurrent_groups_match_serial_bitwise, "
         "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
-        "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
+        "TensorParallelMuon duplicated mode. test_grouped_muon_replays also checks grouped "
+        "weights and momentum under stream contention for both optimizer implementations. "
+        "The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
     KernelEntry(
