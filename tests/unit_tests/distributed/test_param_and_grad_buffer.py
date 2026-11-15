@@ -431,10 +431,9 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
     Utils.destroy_model_parallel()
 
 
-def test_start_param_sync_dp_size_1():
-    """When dp_size == 1 (e.g., expt_dp_size == 1), start_param_sync should set
-    param_gather_dispatched=True and return immediately without launching any
-    all-gather collective."""
+@pytest.mark.parametrize("layer_wise", [False, True])
+def test_start_param_sync_dp_size_1(layer_wise):
+    """A single-rank LayerWise gather is a no-op; replicated buffers need no dispatch."""
     world_size = Utils.world_size
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
 
@@ -442,29 +441,29 @@ def test_start_param_sync_dp_size_1():
         grad_reduce_in_fp32=True,
         use_distributed_optimizer=False,
         overlap_grad_reduce=True,
-        overlap_param_gather=True,
+        overlap_param_gather=layer_wise,
         bucket_size=None,
     )
     module = TestModel(
         input_dim=32, output_dim=32, num_layers=2, bias=False, shared_embedding=False
     ).bfloat16()
+    # Only LayerWise parameters need whole-parameter synchronization. Ordinary replicated
+    # parameters use no parameter-gather schedule.
+    for param in module.parameters():
+        param.is_managed_by_layer_wise_optimizer = layer_wise
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=module
     )
 
-    # Confirm dp_size == 1 in the test environment.
-    for bg in model.bucket_groups:
-        assert bg.intra_distributed_optimizer_instance_size == 1
-
     with mock.patch('torch.distributed.all_gather') as mock_all_gather:
         for bg in model.bucket_groups:
             assert not bg.param_gather_dispatched
-            bg.start_param_sync()
-            assert (
-                bg.param_gather_dispatched
-            ), "param_gather_dispatched should be True after start_param_sync with dp_size=1"
-        # No all-gather should have been called.
-        assert not mock_all_gather.called, "all_gather should not be called when dp_size == 1"
+            if layer_wise:
+                assert bg.intra_distributed_optimizer_instance_size == 1
+        model.start_param_sync()
+        for bg in model.bucket_groups:
+            assert bg.param_gather_dispatched == layer_wise
+        mock_all_gather.assert_not_called()
 
     Utils.destroy_model_parallel()
 
