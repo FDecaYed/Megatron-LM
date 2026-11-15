@@ -903,7 +903,9 @@ class TestTEWrappers:
 
         cp_group = parallel_state.get_context_parallel_group()
         assert cp_group.size() == 1
-        runtime_cp1 = PackedSeqParams(qkv_format="sbhd", cp_group=cp_group, local_cp_size=1)
+        runtime_cp1 = PackedSeqParams(
+            qkv_format="sbhd", cp_group=cp_group, local_cp_size=1, cp_partition_mode="zigzag"
+        )
         assert module.cp_group is None
         reference = None
 
@@ -929,6 +931,7 @@ class TestTEWrappers:
                 assert len(result[1]) == 3  # Replay covers dQ, dK, and dV.
                 assert runtime_cp1.cp_group is cp_group
                 assert runtime_cp1.local_cp_size == 1
+                assert runtime_cp1.cp_partition_mode == "zigzag"
                 assert module.cp_group is None
                 if reference is None:
                     reference = result
