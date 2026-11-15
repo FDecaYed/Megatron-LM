@@ -510,7 +510,7 @@ class MegatronOptimizer(ABC):
         self.ensure_master_weights_for_param_sync()
 
     def stage_model_params_after_grad_buffer_reset(self) -> None:
-        """Restore gather inputs invalidated by clearing gradient storage, without a gather."""
+        """Prepare owned gather inputs after gradient reset without launching new communication."""
         return
 
     def _stage_model_params_from_main_params(self) -> None:
@@ -2418,7 +2418,7 @@ class ChainedOptimizer(MegatronOptimizer):
         return self._step()
 
     def stage_model_params_after_grad_buffer_reset(self) -> None:
-        """Restore each member's own gather inputs; members without shared storage do nothing."""
+        """Prepare each member's owned gathers after reset, completing pending work as needed."""
         for optimizer in self.chained_optimizers:
             optimizer.stage_model_params_after_grad_buffer_reset()
 

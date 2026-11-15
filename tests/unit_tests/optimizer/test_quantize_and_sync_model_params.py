@@ -126,6 +126,54 @@ def test_restaging_waits_for_only_the_owners_pending_gather():
     assert groups[1].param_gather_pinned_before_master_offload
 
 
+def test_model_buffer_pending_gather_finishes_without_master_restore():
+    """Persistent model buffers still own pending work after gradient finalization."""
+    param = torch.nn.Parameter(torch.tensor([1.0]))
+    bucket = _ParamAndGradBucket(
+        [param],
+        torch.tensor([10.0]),
+        torch.zeros(1),
+        0,
+        1,
+        1.0,
+        0,
+        {param: (0, 1, 0)},
+        [],
+        param_gather_plan=ParamGatherPlan.MODEL_BUFFER,
+    )
+    waits = []
+    group = _ParamAndGradBucketGroup.__new__(_ParamAndGradBucketGroup)
+    group.buckets = [bucket]
+    group.ddp_config = SimpleNamespace(use_distributed_optimizer=True, overlap_param_gather=True)
+    group.param_gather_handle = SimpleNamespace(wait=lambda: waits.append("owner"))
+    group.param_gather_dispatched = False
+    sibling_handle = object()
+    sibling = SimpleNamespace(
+        param_gather_handle=sibling_handle, param_gather_pinned_before_master_offload=True
+    )
+    chunk = SimpleNamespace(bucket_groups=[group, sibling], expert_parallel_bucket_groups=[])
+    chunk._start_bucket_group_param_sync = MethodType(
+        DistributedDataParallel._start_bucket_group_param_sync, chunk
+    )
+    optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
+    optimizer.is_stub_optimizer = False
+    optimizer.requires_param_buffer_staging = False
+    optimizer.ddp_config = SimpleNamespace(use_megatron_fsdp=False, overlap_param_gather=True)
+    optimizer.param_sync_bucket_groups = [(chunk, group)]
+
+    def forbidden():
+        raise AssertionError("MODEL_BUFFER must not restore or copy offloaded masters")
+
+    optimizer.ensure_master_weights_for_param_sync = forbidden
+    optimizer._copy_main_params_to_param_buffer = forbidden
+    optimizer.stage_model_params_after_grad_buffer_reset()
+    assert param.item() == 10.0
+    assert waits == ["owner"]
+    assert group.param_gather_handle is None
+    assert sibling.param_gather_handle is sibling_handle
+    assert sibling.param_gather_pinned_before_master_offload
+
+
 class _FakeModelChunk:
     """Records the per-chunk calls the refresh is supposed to make."""
 

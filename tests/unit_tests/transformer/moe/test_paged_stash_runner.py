@@ -218,6 +218,8 @@ def test_retry_restores_only_shared_overlapped_gather_inputs(monkeypatch):
         stage_model_params_after_grad_buffer_reset = (
             DistributedOptimizer.stage_model_params_after_grad_buffer_reset
         )
+        _finish_pending_param_sync = DistributedOptimizer._finish_pending_param_sync
+        param_sync_bucket_groups = ()
 
         def __init__(self, *, shared, overlap):
             self.is_stub_optimizer = False

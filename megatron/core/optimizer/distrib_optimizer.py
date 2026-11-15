@@ -3218,9 +3218,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # buffer here. Finish only outstanding gathers before overwriting that buffer.
         # force_sync consumes an existing handle without dispatching a new gather and
         # is safe even if gradient finalization already reset the logical dispatch flag.
-        for model_chunk, bucket_group in self.param_sync_bucket_groups:
-            if bucket_group.param_gather_handle is not None:
-                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=True)
+        self._finish_pending_param_sync()
 
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
@@ -3250,16 +3248,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ]
             model_chunk.reset_param_sync_dispatch_state(owned_groups)
 
+    def _finish_pending_param_sync(self) -> None:
+        """Consume this owner's pending gathers without restoring or copying master weights."""
+        for model_chunk, bucket_group in self.param_sync_bucket_groups:
+            if bucket_group.param_gather_handle is not None:
+                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=True)
+
     @torch.no_grad()
     def stage_model_params_after_grad_buffer_reset(self) -> None:
-        """Restore this optimizer's gather inputs without clearing gradients or dispatching."""
+        """Finish owned pending gathers and restore shared gather inputs when needed."""
         if (
-            not self.is_stub_optimizer
-            and not self.ddp_config.use_megatron_fsdp
-            and self.requires_param_buffer_staging
-            and self.ddp_config.overlap_param_gather
+            self.is_stub_optimizer
+            or self.ddp_config.use_megatron_fsdp
+            or not self.ddp_config.overlap_param_gather
         ):
+            return
+        if self.requires_param_buffer_staging:
             self._copy_main_params_to_param_buffer()
+        else:
+            # MODEL_BUFFER needs no master copy, but gradient finalization may have reset
+            # its dispatch flag while retaining a speculative gather's handle. Consume that
+            # handle before forward prefetch can attempt a second dispatch into this group.
+            self._finish_pending_param_sync()
 
     @staticmethod
     def _normalize_state_dict_for_grouped_params(state_dict_flat, model_chunk):

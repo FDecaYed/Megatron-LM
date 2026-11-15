@@ -687,6 +687,8 @@ def test_train_step_restores_shared_gather_input_after_gradient_reset(
         stage_model_params_after_grad_buffer_reset = (
             DistributedOptimizer.stage_model_params_after_grad_buffer_reset
         )
+        _finish_pending_param_sync = DistributedOptimizer._finish_pending_param_sync
+        param_sync_bucket_groups = ()
 
         def __init__(self):
             self.is_stub_optimizer = False
