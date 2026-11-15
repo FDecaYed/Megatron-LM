@@ -1116,7 +1116,7 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     loss_mask = torch.ones(1, 2)
     position_ids = torch.tensor([[0, 1]])
     padding_mask = torch.zeros(1, 2, dtype=torch.bool)
-    packed_seq_params = PackedSeqParams(qkv_format="thd")
+    packed_seq_params = PackedSeqParams(qkv_format="thd", cp_partition_mode="zigzag")
     scheduler_batch = ContextParallelBatch(
         boundary_layout="zigzag",
         batches_by_layout={
