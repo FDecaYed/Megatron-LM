@@ -75,3 +75,43 @@ CP>1 runs whose ranks have different valid-token counts; it adds a two-element
 all-reduce per MTP depth per microbatch. Logged `mtp_N loss` is a global
 token-weighted mean, including under static CP, so packed or masked runs may log
 different values from older mean-of-microbatch-means metrics.
+
+## Layout conversion contract
+
+`megatron.core.context_parallel.convert_cp_partition_mode` accepts concrete
+`source_partition_mode` and `target_partition_mode` values (`zigzag` or
+`contiguous`). It calls the same implementation as `convert_cp_layout`;
+there is no separate partition-mode communication backend. `seq_dim` selects
+the tensor's sequence axis. With sequence parallelism, callers must supply the
+matching TP and TP×CP groups.
+
+For packed tensors, prepare a `ContextParallelBatch` through
+`get_batches_on_this_cp_rank`, request both physical layouts, and pass its
+`thd_plan` to conversion. The plan supports different physical token counts on
+the two sides and combines TP×CP redistribution in one all-to-all. The consumer
+must use `batch.get_packed_seq_params(target_layout)` as well as the converted
+tensor. Changing only `PackedSeqParams.cp_partition_mode` is incorrect when
+zigzag attention adds padding. Logical boundaries and physical padded
+boundaries remain distinct; empty documents are allowed within a nonempty pack.
+
+Batch views annotate metadata with its concrete layout. Wrapping metadata
+whose layout is unspecified makes a shallow metadata copy, without rebuilding
+its precomputed tensors or modifying the caller's object. Contradictory layout
+annotations are rejected. The annotation is MCore-only and is not passed to
+Transformer Engine.
+
+The low-level `get_batch_on_this_cp_rank` dispatcher accepts
+`cp_partition_mode` as a spelling of its existing contiguous/zigzag selection.
+It validates conflicts with `use_contiguous_cp`; it does not merely annotate
+the returned tokens. `auto` is a conversion policy, not a physical ordering,
+and is rejected by these tensor and batch APIs.
+
+`ContextParallelLayoutManager.boundary_mode="auto"` retains the existing
+behavior of coalescing adjacent equal-layout layers. `"fixed"` restores the
+boundary layout after each managed layer. This is a **layer-boundary primitive**,
+not an attention-only boundary policy: a transformer layer can also contain an
+MLP or MoE. It is not exposed as a new model configuration option. Migrating
+module consumers, Bridge callers using the older route dataclass, multi-layer
+residual state, and variable-split CUDA graph replay requires further integration
+and validation. The partition-mode spelling alone does not establish support
+for those paths.

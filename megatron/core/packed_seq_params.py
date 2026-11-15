@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -35,6 +36,8 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
     cp_scatter_cache: object = None
+    # Concrete physical ordering. None is retained for callers that do not use layout conversion.
+    cp_partition_mode: Literal["zigzag", "contiguous"] | None = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
