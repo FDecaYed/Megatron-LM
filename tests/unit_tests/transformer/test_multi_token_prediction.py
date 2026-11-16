@@ -4174,7 +4174,7 @@ class TestMultiTokenPredictionHybrid:
             tp_group=tp_group,
             tp_cp_group=tp_cp_group,
             tokens_per_sample=8,
-        )
+        ).prepare_module_layouts()
         source = cp_batch.get_batch("contiguous")
         local_tokens = source["tokens"].chunk(tp, dim=1)[tp_group.rank()]
         # Multiples of three mark existing padding. New THD padding receives
@@ -4732,8 +4732,12 @@ class TestMultiTokenPredictionHybrid:
         model, hidden_states, call_counts, metric_avg_group = self._make_forward_stub()
         static_cp_group = types.SimpleNamespace(size=lambda: 1)
         runtime_cp_group = types.SimpleNamespace(size=lambda: 2)
-        contiguous_packed_seq_params = PackedSeqParams(local_cp_size=2, cp_group=runtime_cp_group)
-        zigzag_packed_seq_params = PackedSeqParams(local_cp_size=2, cp_group=runtime_cp_group)
+        contiguous_packed_seq_params = PackedSeqParams(
+            local_cp_size=2, cp_group=runtime_cp_group, cp_partition_mode="contiguous"
+        )
+        zigzag_packed_seq_params = PackedSeqParams(
+            local_cp_size=2, cp_group=runtime_cp_group, cp_partition_mode="zigzag"
+        )
         zigzag_hidden_states = hidden_states + 10.0
         padding_mask = torch.tensor([[False, True]]) if with_mask else None
         zigzag_padding_mask = torch.tensor([[True, False]]) if with_mask else None

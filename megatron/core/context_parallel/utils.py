@@ -11,6 +11,7 @@ import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
+from .module import attach_cp_layout_views
 
 
 @dataclass(eq=False)
@@ -47,7 +48,20 @@ class ContextParallelBatch:
                     params = copy(params)
                     params.cp_partition_mode = layout
             params_by_layout[layout] = params
-        self.packed_seq_params_by_layout = params_by_layout
+        if any(
+            params is not self.packed_seq_params_by_layout[layout]
+            for layout, params in params_by_layout.items()
+        ):
+            self.packed_seq_params_by_layout = params_by_layout
+
+    def prepare_module_layouts(self):
+        """Prebuild acyclic module views once; legacy/auto graph metadata stays unchanged."""
+        params = self.get_packed_seq_params()
+        if self.thd_plan is not None and params.cp_layout_views is None:
+            self.packed_seq_params_by_layout = attach_cp_layout_views(
+                self.packed_seq_params_by_layout, self.thd_plan
+            )
+        return self
 
     @classmethod
     def from_single_layout(

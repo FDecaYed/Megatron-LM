@@ -13,11 +13,21 @@ from .layout import (
     convert_cp_partition_mode,
     zigzag_to_contiguous,
 )
+from .module import (
+    CPLayoutViews,
+    CpPartitionModeConverter,
+    finalize_packed_seq_params,
+    prepare_module_cp_input,
+)
 from .utils import ContextParallelBatch, get_batches_on_this_cp_rank
 
 __all__ = [
     "CPLayout",
     "CpPartitionMode",
+    "CpPartitionModeConverter",
+    "CPLayoutViews",
+    "finalize_packed_seq_params",
+    "prepare_module_cp_input",
     "ContextParallelBatch",
     "ContextParallelLayoutManager",
     "ContextParallelLayoutState",

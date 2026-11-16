@@ -51,6 +51,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
         "_value_": 1,
     },
     "attention_cp_layout": "zigzag",
+    "cp_partition_mode": None,
     "attention_dropout": 0.0,
     "attention_output_gate": False,
     "attention_softmax_in_fp32": False,

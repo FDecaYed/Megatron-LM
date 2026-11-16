@@ -719,6 +719,7 @@ class ContextParallelLayoutManager:
     tp_group: torch.distributed.ProcessGroup | None
     tp_cp_group: torch.distributed.ProcessGroup | None
     boundary_mode: Literal["auto", "fixed"] = "auto"
+    cuda_graph_impl: str = "none"
     requires_conversion: bool = field(init=False)
 
     def __post_init__(self) -> None:
@@ -790,6 +791,11 @@ class ContextParallelLayoutManager:
         """
         if not self.requires_conversion:
             return None
+
+        if thd_plan is not None and self.cuda_graph_impl == "full_iteration":
+            raise ValueError(
+                "Full-iteration CUDA graphs cannot replay variable THD CP route splits"
+            )
 
         if thd_plan is not None and packed_seq_params_by_layout is not None:
             return ContextParallelLayoutState(

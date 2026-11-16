@@ -614,6 +614,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_gated_norm.py",
             C + "test_hybrid_model.py",
             R + 'test_ssm_replay.py',
+            "tests/unit_tests/context_parallel/test_model_layout.py",
         ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "

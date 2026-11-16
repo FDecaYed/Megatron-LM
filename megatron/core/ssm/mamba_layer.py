@@ -11,6 +11,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from megatron.core.context_parallel.module import CPLayoutIntermediate, prepare_module_cp_input
+
 try:
     from nemo.lens.helpers import managed_span as _otel_managed_span
 except ImportError:
@@ -97,6 +99,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             )
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
         self.tp_group = pg_collection.tp
+        self.pg_collection = pg_collection
 
         self.config = config
         self.submodules_config = submodules
@@ -227,11 +230,19 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
         )
 
-        ssm_output = self.mixer.forward_pre_attn_and_core_attn(
+        branch_input, packed_seq_params, cp_reverse = prepare_module_cp_input(
+            self,
             prepared.branch_input,
+            packed_seq_params,
+            target_layout=self.config.linear_cp_layout,
+        )
+        ssm_output = self.mixer.forward_pre_attn_and_core_attn(
+            branch_input,
             packed_seq_params=packed_seq_params,
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
+        if cp_reverse is not None:
+            ssm_output = CPLayoutIntermediate(ssm_output, cp_reverse)
         return self._pack_two_stage_output(ssm_output, prepared.state)
 
     def forward_post_core_attn(
@@ -244,7 +255,13 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         """Apply Mamba's output projection and the layer's residual-update hook."""
 
         del inference_context, padding_mask
+        cp_reverse = None
+        if isinstance(ssm_output, CPLayoutIntermediate):
+            cp_reverse = ssm_output.converter
+            ssm_output = ssm_output.value
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
+        if cp_reverse is not None:
+            mixer_out_with_bias = cp_reverse.restore_output(mixer_out_with_bias)
         return self._apply_mixer_update(mixer_out_with_bias, residual)
 
     def _get_residual_connection(self):
@@ -306,20 +323,29 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
+                branch_input, packed_seq_params, cp_reverse = prepare_module_cp_input(
+                    self,
+                    prepared.branch_input,
+                    packed_seq_params,
+                    target_layout=self.config.linear_cp_layout,
+                    inference_context=inference_context,
+                )
                 if packed_sequence_cp_metadata is None:
                     mixer_out_with_bias = self.mixer(
-                        prepared.branch_input,
+                        branch_input,
                         inference_context=inference_context,
                         packed_seq_params=packed_seq_params,
                     )
                 else:
                     mixer_out_with_bias = self.mixer(
-                        prepared.branch_input,
+                        branch_input,
                         inference_context=inference_context,
                         packed_seq_params=packed_seq_params,
                         packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                     )
 
+            if cp_reverse is not None:
+                mixer_out_with_bias = cp_reverse.restore_output(mixer_out_with_bias)
             hidden_states = self._apply_mixer_update(
                 mixer_out_with_bias, prepared.state, recompute_context=recompute_context
             )
