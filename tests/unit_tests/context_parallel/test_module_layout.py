@@ -8,14 +8,18 @@ import pytest
 import torch
 
 import megatron.core.context_parallel.module as cp_module
+import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
 from megatron.core.context_parallel.module import (
     finalize_packed_seq_params,
     prepare_module_cp_input,
 )
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.transformer.module import TwoStageAttentionLayer
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -164,6 +168,86 @@ def test_runtime_singleton_needs_no_route_or_communication():
     x = torch.ones(4, 1, 2)
     result, metadata, reverse = prepare_module_cp_input(layer, x, params, target_layout="zigzag")
     assert result is x and metadata is params and reverse is None
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_metadata_only_chunkwise_stack_uses_consumer_physical_lengths(monkeypatch, rank):
+    """Exercise the stack's preparation and GDP's consumer check without GPU kernels."""
+    batch = _batch(monkeypatch).prepare_module_layouts()
+    params = finalize_packed_seq_params(batch.get_packed_seq_params("zigzag"), _group())
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+    stack = HybridStack.__new__(HybridStack)
+    torch.nn.Module.__init__(stack)
+    stack._has_custom_layers = False
+    stack._has_linear_layer_with_chunkwise_cp = True
+    stack._resolve_runtime_cp_layout = lambda params: (group, None)
+    build_metadata = hybrid_block_module.build_packed_sequence_cp_metadata
+
+    class ConsumerChecked(Exception):
+        pass
+
+    def check_consumer(*args, **kwargs):
+        metadata = build_metadata(*args, **kwargs)
+        # The converted contiguous activation has four tokens per CP rank,
+        # even though the incoming zigzag view has six physical slots.
+        GatedDeltaProductMixer._chunkwise_packed_metadata(
+            None, params.cp_layout_views.contiguous, 4, metadata
+        )
+        assert metadata.local_seq_idx.tolist() == ([[1, 1, 1, 2]] if rank == 0 else [[2, 2, 2, 2]])
+        assert metadata.local_cu_seqlens.tolist() == ([0, 3, 4] if rank == 0 else [0, 4])
+        # Stop before downstream model execution; both real metadata methods ran.
+        raise ConsumerChecked
+
+    monkeypatch.setattr(hybrid_block_module, "build_packed_sequence_cp_metadata", check_consumer)
+    with pytest.raises(ConsumerChecked):
+        stack.forward(torch.zeros(6, 1, 2), None, packed_seq_params=params)
+
+
+@pytest.mark.parametrize(
+    "mode,linear_layout,tag,cp_size,needs_batch",
+    [
+        ("contiguous", "zigzag", None, 2, True),
+        ("contiguous", "zigzag", "contiguous", 2, True),
+        ("zigzag", "contiguous", None, 2, False),
+        (None, "zigzag", "contiguous", 2, True),
+        (None, "zigzag", None, 2, False),
+        ("contiguous", "zigzag", "contiguous", 1, False),
+    ],
+)
+def test_metadata_only_mtp_checks_the_actual_source_layout(
+    mode, linear_layout, tag, cp_size, needs_batch
+):
+    """Missing batch views must not silently skip required MTP redistribution."""
+    block = SimpleNamespace(
+        config=SimpleNamespace(
+            cp_partition_mode=mode, linear_cp_layout=linear_layout, attention_cp_layout="zigzag"
+        ),
+        cp_group=_group(cp_size),
+        tp_group=_group(1),
+        tp_cp_group=None,
+        sequence_parallel=False,
+    )
+    hidden_states = torch.arange(8.0).reshape(4, 1, 2)
+    params = None if tag is None else PackedSeqParams(qkv_format="thd", cp_partition_mode=tag)
+    kwargs = dict(
+        input_ids=torch.arange(4).reshape(1, 4),
+        position_ids=torch.arange(4).reshape(1, 4),
+        hidden_states=hidden_states,
+        decoder_input=None,
+        mhc_multistream=None,
+        labels=None,
+        loss_mask=None,
+        mtp_input_mask=None,
+        packed_seq_params=params,
+        cp_batch=None,
+    )
+    if needs_batch:
+        with pytest.raises(ValueError, match="cp_batch is required"):
+            MultiTokenPredictionBlock.prepare_cp_layout(block, **kwargs)
+    else:
+        result = MultiTokenPredictionBlock.prepare_cp_layout(block, **kwargs)
+        assert result.hidden_states is hidden_states
+        assert result.packed_seq_params is params
 
 
 @pytest.mark.parametrize("graph", ["local", "transformer_engine", "full_iteration"])

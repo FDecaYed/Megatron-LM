@@ -704,6 +704,9 @@ class HybridStack(MegatronModule):
             linear_params = packed_seq_params
             if packed_seq_params_by_layout is not None:
                 linear_params = packed_seq_params_by_layout["contiguous"]
+            elif packed_seq_params.cp_layout_views is not None:
+                # Metadata-only callers still provide the consumer's physical view.
+                linear_params = packed_seq_params.cp_layout_views.contiguous
             if linear_params.seq_idx is None:
                 raise ValueError("Packed chunkwise CP requires packed_seq_params.seq_idx")
             packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(

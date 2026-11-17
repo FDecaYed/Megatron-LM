@@ -141,6 +141,13 @@ additional padding is rejected: prepare it from the raw batch instead. The old
 second route builder. Its old equal-length `ThdCpRoute` constructor is not retained;
 callers migrate to `THDCPLayoutPlan` and the returned target metadata.
 
+Metadata-only Hybrid callers reuse the contiguous leaf when preparing packed
+chunkwise recurrence metadata, even if the residual input is zigzag with different
+physical padding. MTP resolves the source layout from the actual batch or tagged
+metadata, falling back to the model boundary policy. When MTP needs a different
+layout, callers must supply the full `ContextParallelBatch` with token, label and
+mask views; a metadata-only adapter does not provide these tensors.
+
 Two-stage execution carries its reverse converter with each intermediate result,
 so interleaved calls cannot overwrite one another's layout state. Runtime CP1
 does not convert and requires no route. TP×CP groups are resolved from the same
